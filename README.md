@@ -5,149 +5,190 @@
 <h1 align="center">Vanta</h1>
 
 <p align="center">
-  <b>AI-native spatial computing environment for Sorabbyngo OS</b>
+  <b>The spatial desktop of Sorabbyngo OS</b><br>
+  <i>Where intent meets the screen — and the direct path never dies.</i>
 </p>
 
 <p align="center">
   <img alt="Status: pre-alpha" src="https://img.shields.io/badge/status-pre--alpha-orange">
   <img alt="Language: Rust" src="https://img.shields.io/badge/language-Rust-b7410e">
-  <img alt="Display protocol: Wayland" src="https://img.shields.io/badge/display-Wayland-4c7dff">
-  <img alt="Part of Sorabbyngo OS" src="https://img.shields.io/badge/part%20of-Sorabbyngo%20OS-111827">
+  <img alt="Display: Wayland" src="https://img.shields.io/badge/display-Wayland-4c7dff">
+  <img alt="Foundation: Smithay" src="https://img.shields.io/badge/foundation-Smithay-5b21b6">
 </p>
-
-> **Status: pre-alpha, in design.** Vanta is not runnable yet. This README describes what we are building and how. The [roadmap](#roadmap) shows where we are, and the full plan is in [docs/Vanta-Vision-and-Plan.pdf](docs/Vanta-Vision-and-Plan.pdf).
-
-## What is Vanta
-
-Vanta is the spatial and interactive environment of Sorabbyngo OS. It is not designed as a traditional Linux desktop. It is the human-facing layer through which people see, touch and direct the **intelligent objects, spaces, agents and capabilities** that the Sorabbyngo platform provides.
-
-It combines a Wayland compositor with an AI-native interaction model and the **ObjectSpace** runtime. Users work with objects and spaces instead of applications and files, and every existing Linux application keeps working.
-
-> **ObjectSpace defines the world. Vanta is how the user experiences and manipulates that world.**
-
-## The idea
-
-Traditional desktops are organized around applications:
-
-```text
-User → Application → File → Operating System
-```
-
-Vanta changes the model. The user states what they want, or manipulates objects directly, and applications become implementation details.
-
-- A document is not merely a file.
-- A workspace is not merely a collection of windows.
-- An application is not something the user needs to think about.
-
-Two paths lead into the system, and Vanta is where both begin and end:
-
-```text
-Direct path:  User → Vanta → ObjectSpace → Vanta renders the result
-Intent path:  User → Vanta → AION → ObjectSpace → Vanta renders the result
-```
-
-The direct path always works. The intent path goes through **AION**, the intelligence layer of Sorabbyngo OS, and is optional.
-
-## Principles
-
-**What Vanta is**
-
-| Principle | In practice |
-|---|---|
-| Intent-first, never intent-only | Intent is the default way to work, and the direct path (mouse, keyboard, touch) always stays available |
-| Objects instead of files | Information is an intelligent, contextual object provided by ObjectSpace |
-| Spaces instead of windows | Work lives in persistent spaces and contexts |
-| AI-native | AI is part of the environment, not only an app inside it |
-| Spatial interaction | Objects and spaces can be shown and manipulated spatially (later phases) |
-| Context-aware | Relationships between objects, tasks, spaces and sessions are preserved |
-| Local-first | Core functionality works without a permanent cloud connection |
-| Privacy-first | User data, context and interactions stay under the user's control |
-| Linux-compatible | Existing Linux software keeps working |
-
-**Engineering rules that make it reliable**
-
-1. **The direct path always works.** Unplug the AI and the desktop must still feel complete.
-2. **The compositor never waits on a model.** Windows appear instantly. AI-informed placement arrives afterward as an animation.
-3. **One door for every action.** Shortcuts, the GUI and AION use the same typed action API. The AI has no private powers.
-4. **Predictable and undoable.** Every AI action is visible and can be undone. Destructive actions ask first.
-5. **No config files required.** Every setting has a GUI and can be changed by asking.
-6. **Light by default.** Small footprint, quick start, and spatial features cost nothing when unused.
-7. **Simple for non-technical users.** Familiar behavior first, with power features discoverable but never required.
-
-## Architecture
-
-| Layer | Role |
-|---|---|
-| **Vanta** | Compositor, window system, shell, settings, intent client, rendering and animation |
-| **AION** | Intelligence layer: interprets intent and plans workflows |
-| **ObjectSpace** | Objects, spaces, relationships, context, memory, sessions, permissions, synchronization |
-| Platform services | Byngox, Byngonet, HAL, CML, Sentinel |
-| Core and kernel | Sorabbyngo Core and the Sorabbyngo OS kernel |
-| Linux and hardware | Linux compatibility layer, drivers, hardware |
-
-Vanta is a set of cooperating processes in one Rust workspace:
-
-| Component | Role |
-|---|---|
-| `vanta-comp` | Wayland compositor: window management, tiling and floating, animations, rendering, XWayland |
-| `vanta-shell` | Panel, launcher, dock, notifications, lock screen, overview |
-| `vanta-settings` | Settings app and the daemon that stores and applies settings live |
-| `vanta-intent` | Client for AION: voice and text capture, feedback, confirmations, undo, and a minimal local fallback for core commands |
-| `vanta-objects` | Bridge to ObjectSpace: projects objects and spaces into windows and scenes, and wraps legacy apps as objects |
-| `vanta-ipc` | The shared typed action API and message types |
-
-**Windows are one projection of an object.** A legacy Linux application is wrapped as an object, so it can belong to a space while still appearing as an ordinary window. Details are in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-
-## Motion
-
-Motion is part of how the computer communicates, not decoration. Vanta aims for smooth transitions, spring and Bézier animation curves with per-event settings, dynamic layout changes and intelligent object placement, with effects budgeted so they don't quietly drain the battery.
-
-## Technology (planned)
-
-- **Rust** for the compositor, shell, daemons and IPC
-- **[Smithay](https://github.com/Smithay/smithay)** as the Wayland compositor foundation, with XWayland for X11 apps
-- **C and C++** at the edges, such as local AI engines reached through bindings
-- **AION and ObjectSpace** reached through stable interfaces, stubbed in early phases
-
-## Roadmap
-
-- [x] Name, identity and repository
-- [ ] **Phase 0:** prototype the feel on Hyprland with a basic shell
-- [ ] **Phase 1:** compositor skeleton on Smithay, running nested in a window
-- [ ] **Phase 2:** tiling, floating, snapping, workspaces and the animation engine
-- [ ] **Phase 3:** shell with panel, launcher, notifications and lock screen
-- [ ] **Phase 4:** action API, settings daemon and settings app
-- [ ] **Phase 5:** intent path with AION, text first, then voice
-- [ ] **Phase 6:** ObjectSpace integration: objects and spaces as windows
-- [ ] **Phase 7:** installable Sorabbyngo OS session
-- [ ] **Phase 8:** spatial computing: gestures, projection, cross-device spaces
-
-## Repository layout (planned)
-
-```text
-assets/      logos and brand files
-docs/        architecture, UX principles, the full plan (PDF)
-crates/
-  vanta-comp/       compositor
-  vanta-shell/      panel, launcher, notifications
-  vanta-settings/   settings app and daemon
-  vanta-intent/     AION client, voice and text capture
-  vanta-objects/    ObjectSpace bridge
-  vanta-ipc/        shared action API
-```
-
-## Developing
-
-Vanta can't be run yet. When the first crates land, development will need Linux with a Wayland-capable graphics stack and a recent stable Rust toolchain (via [rustup](https://rustup.rs)). Build and run instructions will be added here as soon as there is something to run.
-
-## Part of Sorabbyngo OS
-
-Vanta is one component of the Sorabbyngo OS ecosystem. See the [sorabbyngo-os](https://github.com/sorabbyngo-os) organization for the rest.
-
-## License
-
-To be decided. Until a license is added, all rights are reserved.
 
 ---
 
-<p align="center"><i>Sorabbyngo. The Rhythm of Digital Life.</i></p>
+## Vision
+
+Most desktops are filing cabinets with windows.
+
+Vanta is the **presence** of the machine: a spatial Wayland environment where work lives in **spaces**, meaning lives in **objects**, and intelligence is invited — never required.
+
+You should be able to:
+
+- Point, type, and tile as on any serious Linux desktop  
+- Speak or write intent and watch the world rearrange through **AION**  
+- Continue a space across devices without thinking about IPs or SSH  
+- Run every normal Linux app while the native model stays objects and spaces  
+
+Inspiration is simple: an OS that feels continuous — closer to a companion environment than a launcher grid — while remaining a real, inspectable, Linux-compatible system.
+
+> **ObjectSpace defines the world.  
+> AION decides and mediates.  
+> Vanta is how you see and touch it.  
+> Chameha is how you speak with it.**
+
+---
+
+## Interaction model
+
+```text
+Traditional:  User → Application → File → OS
+
+Sorabbyngo:   User → Intent or Direct action
+                ↓
+              Vanta (this project)
+                ├── direct: input → layout → pixels
+                └── intent: Chameha → AION → ObjectSpace → Vanta renders
+Path
+Behavior
+Direct
+Mouse, keyboard, touch, shortcuts. Always complete without AI.
+Intent
+Voice/text via Chameha → AION plans → mediated actions → Vanta updates.
+Rules that do not bend:
+The compositor never blocks on a model.
+AI has no private powers — same typed action API as the GUI.
+Everything destructive is visible and undoable where possible.
+Spatial features cost nothing when unused.
+Architecture
+┌─────────────────────────────────────────────┐
+│  Vanta                                      │
+│  ┌─────────────┐  ┌──────────────────────┐  │
+│  │ vanta-comp  │  │ vanta-shell          │  │
+│  │ Wayland     │  │ panel, launcher,     │  │
+│  │ compositor  │  │ notifications, lock  │  │
+│  └──────┬──────┘  └──────────┬───────────┘  │
+│         │     vanta-ipc      │              │
+│  ┌──────┴────────────────────┴───────────┐  │
+│  │ vanta-intent │ vanta-objects │ settings│  │
+│  │ (→ AION)     │ (→ ObjectSpace)         │  │
+│  └──────────────┴─────────────────────────┘  │
+│         Chameha lives here (voice / persona)  │
+└─────────────────────────────────────────────┘
+         │                    │
+         ▼                    ▼
+      AION                 ObjectSpace
+   (control plane)      (objects & spaces)
+Crate (planned)
+Responsibility
+vanta-comp
+Smithay-based compositor: surfaces, seats, outputs, tiling/floating, animation
+vanta-shell
+Panel, launcher, dock, overview, notifications, lock screen
+vanta-ipc
+Typed action API shared by GUI, shortcuts, and AION
+vanta-settings
+Live settings daemon + UI
+vanta-intent
+Bridge to AION; text first, voice via Chameha
+vanta-objects
+Project ObjectSpace into windows/scenes; wrap X11/Wayland apps as objects
+Chameha is not a separate desktop. It is the conversational face inside Vanta.
+AION is not embedded as a second compositor brain. It is the system control plane Vanta calls.
+Technical foundation
+Layer
+Choice
+Why
+Language
+Rust
+Safety, performance, Smithay ecosystem
+Compositor
+Smithay
+Serious Wayland server toolkit in Rust
+Protocol
+Wayland + XWayland
+Modern path + legacy apps
+Session
+systemd / logind (Fedora bootc base)
+Seats, multi-seat, idle
+IPC
+Typed messages over local transport
+One door for all actions
+AI
+Client only (AION)
+Compositor stays responsive
+Development target for early phases: nested Smithay session inside an existing Wayland (or X11) desktop — no custom kernel, no full OS image required.
+What you can build on a modest machine
+Vanta is the right place to work before the home lab:
+Work
+Needs full OS image?
+Needs heavy GPU compile?
+Repo layout, IPC types, docs
+No
+No
+Smithay “hello compositor” nested window
+No
+Low–medium (Rust)
+Tiling / floating logic, unit tests
+No
+Low
+Shell UI prototypes (egui/iced later)
+No
+Low
+bootc image, NVIDIA stack
+Yes
+Lab
+Phase focus on this PC: scaffolding + nested compositor + action API stubs.
+Roadmap
+[x] Identity, vision, repository
+[ ] Phase 0 — Workspace layout, vanta-ipc types, architecture docs
+[ ] Phase 1 — Smithay nested compositor skeleton (vanta-comp)
+[ ] Phase 2 — Tiling, floating, workspaces, basic animation
+[ ] Phase 3 — Shell: panel, launcher, notifications
+[ ] Phase 4 — Settings daemon + action API wired end-to-end
+[ ] Phase 5 — Intent path (text → AION stub → confirm/undo)
+[ ] Phase 6 — ObjectSpace bridge; apps as objects
+[ ] Phase 7 — Installable session on Sorabbyngo/Fedora bootc
+[ ] Phase 8 — Spatial / multi-device continuity (Byngonet)
+Repository layout
+vanta/
+├── README.md
+├── assets/
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── PRINCIPLES.md
+├── Cargo.toml                 # workspace
+└── crates/
+    ├── vanta-comp/
+    ├── vanta-shell/
+    ├── vanta-ipc/
+    ├── vanta-settings/
+    ├── vanta-intent/
+    └── vanta-objects/
+Developing
+Today (design + skeleton): Linux, Rust via rustup, Wayland session recommended for nested testing.
+# when crates exist
+cargo build -p vanta-comp
+cargo run -p vanta-comp    # nested compositor window
+Full session integration targets the Fedora bootc–based Sorabbyngo image (see fedora-base).
+Related
+Project
+Role
+aion
+AI runtime / control plane
+objectspace
+Objects and spaces
+chameha
+Voice and personality (in Vanta)
+byngonet
+Multi-device mesh
+sorabbyngo-os
+OS umbrella
+fedora-base
+Immutable base inheritance
+License
+To be decided. All rights reserved until a license is published.
+�
+Sorabbyngo
+The Rhythm of Digital Life 
