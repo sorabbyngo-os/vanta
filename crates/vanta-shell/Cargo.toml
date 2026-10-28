@@ -1,0 +1,9 @@
+[package]
+name = "vanta-shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vanta-ipc = { path = "../vanta-ipc" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

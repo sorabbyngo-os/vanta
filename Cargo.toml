@@ -2,5 +2,5 @@
 resolver = "2"
 members = [
     "crates/vanta-ipc",
-    "crates/vanta-comp",
+    "crates/vanta-comp", "crates/vanta-shell",
 ]
