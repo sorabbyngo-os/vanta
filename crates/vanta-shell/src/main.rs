@@ -9,9 +9,9 @@ fn main() {
         )
         .init();
 
-    let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "(unset)".into());
+    let wayland_display = std::env::var("WAYLAND_DISPLAY").unwrap_or_else(|_| "(unset)".into());
     tracing::info!("vanta-shell starting");
-    tracing::info!(%display, "Wayland display");
+    tracing::info!(wayland_display = %wayland_display, "Wayland display");
     println!("vanta-shell S0: ok (panel/layer-shell next)");
-    println!("  WAYLAND_DISPLAY={display}");
+    println!("  WAYLAND_DISPLAY={wayland_display}");
 }
