@@ -19,6 +19,7 @@ pub fn init_winit(
     state: &mut Vanta,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut backend, winit) = winit::init()?;
+    backend.window().set_title("Vanta");
 
     let mode = Mode {
         size: backend.window_size(),
@@ -26,19 +27,24 @@ pub fn init_winit(
     };
 
     let output = Output::new(
-        "winit".to_string(),
+        "vanta".to_string(),
         PhysicalProperties {
             size: (0, 0).into(),
             subpixel: Subpixel::Unknown,
             make: "Sorabbyngo".into(),
             model: "Vanta".into(),
-            serial_number: "Unknown".into(),
+            serial_number: "0".into(),
         },
     );
-    let _global = output.create_global::<Vanta>(&state.display_handle);
-    output.change_current_state(Some(mode), Some(Transform::Flipped180), None, Some((0, 0).into()));
-    output.set_preferred(mode);
 
+    let _global = output.create_global::<Vanta>(&state.display_handle);
+    output.change_current_state(
+        Some(mode),
+        Some(Transform::Flipped180),
+        None,
+        Some((0, 0).into()),
+    );
+    output.set_preferred(mode);
     state.space.map_output(&output, (0, 0));
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
@@ -60,7 +66,6 @@ pub fn init_winit(
             WinitEvent::Redraw => {
                 let size = backend.window_size();
                 let damage = Rectangle::from_size(size);
-
                 {
                     let (renderer, mut framebuffer) = backend.bind().unwrap();
                     smithay::desktop::space::render_output::<
@@ -77,7 +82,7 @@ pub fn init_winit(
                         [&state.space],
                         &[],
                         &mut damage_tracker,
-                        [0.1, 0.1, 0.1, 1.0],
+                        [0.05, 0.06, 0.09, 1.0],
                     )
                     .unwrap();
                 }
@@ -95,8 +100,6 @@ pub fn init_winit(
                 state.space.refresh();
                 state.popups.cleanup();
                 let _ = state.display_handle.flush_clients();
-
-                // Ask for redraw to schedule new frame.
                 backend.window().request_redraw();
             }
             WinitEvent::CloseRequested => {
