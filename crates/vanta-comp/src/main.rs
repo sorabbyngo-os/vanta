@@ -4,6 +4,8 @@ mod handlers;
 
 mod grabs;
 mod input;
+mod ipc;
+mod layout;
 mod state;
 mod winit;
 
@@ -18,6 +20,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let display: Display<Vanta> = Display::new()?;
 
     let mut state = Vanta::new(&mut event_loop, display);
+
+    // Start the local control socket before entering the compositor loop.
+    let _ipc_server = ipc::start(&mut event_loop)?;
 
     // Open a Wayland/X11 window for our nested compositor
     crate::winit::init_winit(&mut event_loop, &mut state)?;

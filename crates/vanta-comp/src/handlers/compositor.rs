@@ -1,14 +1,15 @@
-use crate::{Vanta, grabs::resize_grab, state::ClientState};
+use crate::{grabs::resize_grab, state::ClientState, Vanta};
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
     reexports::wayland_server::{
-        Client,
         protocol::{wl_buffer, wl_surface::WlSurface},
+        Client,
     },
     wayland::{
         buffer::BufferHandler,
         compositor::{
-            CompositorClientState, CompositorHandler, CompositorState, get_parent, is_sync_subsurface,
+            get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler,
+            CompositorState,
         },
         shm::{ShmHandler, ShmState},
     },

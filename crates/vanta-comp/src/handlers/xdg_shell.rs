@@ -1,14 +1,16 @@
 use smithay::{
-    desktop::{PopupKind, PopupManager, Space, Window, find_popup_root_surface, get_popup_toplevel_coords},
+    desktop::{
+        find_popup_root_surface, get_popup_toplevel_coords, PopupKind, PopupManager, Space, Window,
+    },
     input::{
-        Seat,
         pointer::{Focus, GrabStartData as PointerGrabStartData},
+        Seat,
     },
     reexports::{
         wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::{
-            Resource,
             protocol::{wl_seat, wl_surface::WlSurface},
+            Resource,
         },
     },
     utils::{Rectangle, Serial},
@@ -22,8 +24,8 @@ use smithay::{
 };
 
 use crate::{
-    Vanta,
     grabs::{MoveSurfaceGrab, ResizeSurfaceGrab},
+    Vanta,
 };
 
 impl XdgShellHandler for Vanta {
@@ -33,48 +35,84 @@ impl XdgShellHandler for Vanta {
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
+
+        if self.register_window(window.clone()).is_none() {
+            tracing::error!(
+                smithay_window_id = window.id(),
+                "Vanta window ID space exhausted; window will not be registered"
+            );
+        }
+
         self.space.map_element(window, (0, 0), false);
+        self.relayout_windows();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {
         self.unconstrain_popup(&surface);
-        let _ = self.popups.track_popup(PopupKind::Xdg(surface));
+
+        if let Err(error) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+            eprintln!("vanta-comp: failed to track popup: {error}");
+        }
     }
 
-    fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
         surface.with_pending_state(|state| {
-            let geometry = positioner.get_geometry();
-            state.geometry = geometry;
+            state.geometry = positioner.get_geometry();
             state.positioner = positioner;
         });
+
         self.unconstrain_popup(&surface);
         surface.send_repositioned(token);
     }
 
     fn move_request(&mut self, surface: ToplevelSurface, seat: wl_seat::WlSeat, serial: Serial) {
-        let seat = Seat::from_resource(&seat).unwrap();
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
 
         let wl_surface = surface.wl_surface();
 
-        if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
-            let pointer = seat.get_pointer().unwrap();
+        let Some(start_data) = check_grab(&seat, wl_surface, serial) else {
+            return;
+        };
 
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == wl_surface)
-                .unwrap()
-                .clone();
-            let initial_window_location = self.space.element_location(&window).unwrap();
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
-            let grab = MoveSurfaceGrab {
-                start_data,
-                window,
-                initial_window_location,
-            };
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == wl_surface)
+            })
+            .cloned()
+        else {
+            return;
+        };
 
-            pointer.set_grab(self, grab, serial, Focus::Clear);
-        }
+        let Some(initial_window_location) = self.space.element_location(&window) else {
+            return;
+        };
+
+        self.make_window_floating(&window);
+
+        let grab = MoveSurfaceGrab {
+            start_data,
+            window,
+            initial_window_location,
+            snap_target: None,
+            minimize_target: false,
+        };
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
     fn resize_request(
@@ -84,41 +122,63 @@ impl XdgShellHandler for Vanta {
         serial: Serial,
         edges: xdg_toplevel::ResizeEdge,
     ) {
-        let seat = Seat::from_resource(&seat).unwrap();
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
 
         let wl_surface = surface.wl_surface();
 
-        if let Some(start_data) = check_grab(&seat, wl_surface, serial) {
-            let pointer = seat.get_pointer().unwrap();
+        let Some(start_data) = check_grab(&seat, wl_surface, serial) else {
+            return;
+        };
 
-            let window = self
-                .space
-                .elements()
-                .find(|w| w.toplevel().unwrap().wl_surface() == wl_surface)
-                .unwrap()
-                .clone();
-            let initial_window_location = self.space.element_location(&window).unwrap();
-            let initial_window_size = window.geometry().size;
+        let Some(pointer) = seat.get_pointer() else {
+            return;
+        };
 
-            surface.with_pending_state(|state| {
-                state.states.set(xdg_toplevel::State::Resizing);
-            });
+        let Some(window) = self
+            .space
+            .elements()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == wl_surface)
+            })
+            .cloned()
+        else {
+            return;
+        };
 
-            surface.send_pending_configure();
+        let Some(initial_window_location) = self.space.element_location(&window) else {
+            return;
+        };
 
-            let grab = ResizeSurfaceGrab::start(
-                start_data,
-                window,
-                edges.into(),
-                Rectangle::new(initial_window_location, initial_window_size),
-            );
+        let initial_window_size = window.geometry().size;
 
-            pointer.set_grab(self, grab, serial, Focus::Clear);
-        }
+        self.make_window_floating(&window);
+
+        surface.with_pending_state(|state| {
+            state.states.set(xdg_toplevel::State::Resizing);
+        });
+
+        surface.send_pending_configure();
+
+        let grab = ResizeSurfaceGrab::start(
+            start_data,
+            window,
+            edges.into(),
+            Rectangle::new(initial_window_location, initial_window_size),
+        );
+
+        pointer.set_grab(self, grab, serial, Focus::Clear);
     }
 
     fn grab(&mut self, _surface: PopupSurface, _seat: wl_seat::WlSeat, _serial: Serial) {
-        // TODO popup grabs
+        // TODO: implement popup grabs.
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        self.unregister_window_for_surface(surface.wl_surface());
     }
 }
 
@@ -129,15 +189,13 @@ fn check_grab(
 ) -> Option<PointerGrabStartData<Vanta>> {
     let pointer = seat.get_pointer()?;
 
-    // Check that this surface has a click grab.
     if !pointer.has_grab(serial) {
         return None;
     }
 
     let start_data = pointer.grab_start_data()?;
-
     let (focus, _) = start_data.focus.as_ref()?;
-    // If the focus was for a different surface, ignore the request.
+
     if !focus.id().same_client_as(&surface.id()) {
         return None;
     }
@@ -145,41 +203,45 @@ fn check_grab(
     Some(start_data)
 }
 
-/// Should be called on `WlSurface::commit`
+/// Should be called on WlSurface::commit.
 pub fn handle_commit(popups: &mut PopupManager, space: &Space<Window>, surface: &WlSurface) {
-    // Handle toplevel commits.
     if let Some(window) = space
         .elements()
-        .find(|w| w.toplevel().unwrap().wl_surface() == surface)
+        .find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == surface)
+        })
         .cloned()
     {
         let initial_configure_sent = with_states(surface, |states| {
             states
                 .data_map
                 .get::<XdgToplevelSurfaceData>()
-                .unwrap()
-                .lock()
-                .unwrap()
-                .initial_configure_sent
+                .and_then(|data| data.lock().ok())
+                .is_some_and(|data| data.initial_configure_sent)
         });
 
         if !initial_configure_sent {
-            window.toplevel().unwrap().send_configure();
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.send_configure();
+            }
         }
     }
 
-    // Handle popup commits.
     popups.commit(surface);
+
     if let Some(popup) = popups.find_popup(surface) {
         match popup {
             PopupKind::Xdg(ref xdg) => {
                 if !xdg.is_initial_configure_sent() {
-                    // NOTE: This should never fail as the initial configure is always
-                    // allowed.
-                    xdg.send_configure().expect("initial configure failed");
+                    if let Err(error) = xdg.send_configure() {
+                        eprintln!("vanta-comp: failed to send initial popup configure: {error}");
+                    }
                 }
             }
-            PopupKind::InputMethod(ref _input_method) => {}
+
+            PopupKind::InputMethod(_) => {}
         }
     }
 }
@@ -189,20 +251,27 @@ impl Vanta {
         let Ok(root) = find_popup_root_surface(&PopupKind::Xdg(popup.clone())) else {
             return;
         };
-        let Some(window) = self
-            .space
-            .elements()
-            .find(|w| w.toplevel().unwrap().wl_surface() == &root)
-        else {
+
+        let Some(window) = self.space.elements().find(|window| {
+            window
+                .toplevel()
+                .is_some_and(|toplevel| toplevel.wl_surface() == &root)
+        }) else {
             return;
         };
 
-        let output = self.space.outputs().next().unwrap();
-        let output_geo = self.space.output_geometry(output).unwrap();
-        let window_geo = self.space.element_geometry(window).unwrap();
+        let Some(output) = self.space.outputs().next() else {
+            return;
+        };
 
-        // The target geometry for the positioner should be relative to its parent's geometry, so
-        // we will compute that here.
+        let Some(output_geo) = self.space.output_geometry(output) else {
+            return;
+        };
+
+        let Some(window_geo) = self.space.element_geometry(window) else {
+            return;
+        };
+
         let mut target = output_geo;
         target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(popup.clone()));
         target.loc -= window_geo.loc;

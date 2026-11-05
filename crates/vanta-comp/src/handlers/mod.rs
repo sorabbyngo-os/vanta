@@ -3,21 +3,30 @@ mod xdg_shell;
 
 use crate::Vanta;
 
-//
-// Wl Seat
-//
-
-use smithay::input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source};
-use smithay::input::pointer::Focus;
-use smithay::input::{Seat, SeatHandler, SeatState};
-use smithay::reexports::wayland_server::Resource;
-use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::utils::Serial;
-use smithay::wayland::output::OutputHandler;
-use smithay::wayland::pointer_constraints::PointerConstraintsHandler;
-use smithay::wayland::selection::SelectionHandler;
-use smithay::wayland::selection::data_device::{
-    DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler, set_data_device_focus,
+use smithay::{
+    desktop::{layer_map_for_output, LayerSurface},
+    input::dnd::{DnDGrab, DndGrabHandler, GrabType, Source},
+    input::pointer::Focus,
+    input::{Seat, SeatHandler, SeatState},
+    output::Output,
+    reexports::wayland_server::{
+        protocol::{wl_output, wl_surface::WlSurface},
+        Resource,
+    },
+    utils::Serial,
+    wayland::{
+        output::OutputHandler,
+        pointer_constraints::PointerConstraintsHandler,
+        selection::{
+            data_device::{
+                set_data_device_focus, DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
+            },
+            SelectionHandler,
+        },
+        shell::wlr_layer::{
+            Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+        },
+    },
 };
 
 impl SeatHandler for Vanta {
@@ -29,20 +38,21 @@ impl SeatHandler for Vanta {
         &mut self.seat_state
     }
 
-    fn cursor_image(&mut self, _seat: &Seat<Self>, _image: smithay::input::pointer::CursorImageStatus) {}
+    fn cursor_image(
+        &mut self,
+        _seat: &Seat<Self>,
+        _image: smithay::input::pointer::CursorImageStatus,
+    ) {
+    }
 
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.display_handle;
-        let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        let client = focused.and_then(|surface| dh.get_client(surface.id()).ok());
         set_data_device_focus(dh, seat, client);
     }
 }
 
 impl PointerConstraintsHandler for Vanta {}
-
-//
-// Wl Data Device
-//
 
 impl SelectionHandler for Vanta {
     type SelectionUserData = ();
@@ -55,6 +65,7 @@ impl DataDeviceHandler for Vanta {
 }
 
 impl DndGrabHandler for Vanta {}
+
 impl WaylandDndGrabHandler for Vanta {
     fn dnd_requested<S: Source>(
         &mut self,
@@ -66,25 +77,77 @@ impl WaylandDndGrabHandler for Vanta {
     ) {
         match type_ {
             GrabType::Pointer => {
-                let ptr = seat.get_pointer().unwrap();
-                let start_data = ptr.grab_start_data().unwrap();
+                let Some(pointer) = seat.get_pointer() else {
+                    source.cancel();
+                    return;
+                };
 
-                // create a dnd grab to start the operation
+                let Some(start_data) = pointer.grab_start_data() else {
+                    source.cancel();
+                    return;
+                };
+
                 let grab = DnDGrab::new_pointer(&self.display_handle, start_data, source, seat);
-                ptr.set_grab(self, grab, serial, Focus::Keep);
+
+                pointer.set_grab(self, grab, serial, Focus::Keep);
             }
+
             GrabType::Touch => {
-                // vanta lacks touch handling
+                // Vanta does not implement touch-based drag-and-drop yet.
                 source.cancel();
             }
         }
     }
 }
 
-//
-// Wl Output & Xdg Output
-//
-
 impl OutputHandler for Vanta {}
+
+impl WlrLayerShellHandler for Vanta {
+    fn shell_state(&mut self) -> &mut WlrLayerShellState {
+        &mut self.layer_shell_state
+    }
+
+    fn new_layer_surface(
+        &mut self,
+        surface: WlrLayerSurface,
+        wl_output: Option<wl_output::WlOutput>,
+        _layer: Layer,
+        namespace: String,
+    ) {
+        eprintln!("vanta-comp: new layer surface namespace={namespace}");
+
+        let output = wl_output
+            .as_ref()
+            .and_then(Output::from_resource)
+            .or_else(|| self.space.outputs().next().cloned());
+
+        let Some(output) = output else {
+            eprintln!("vanta-comp: cannot map layer surface {namespace}: no output available");
+            return;
+        };
+
+        let mut map = layer_map_for_output(&output);
+        let layer = LayerSurface::new(surface, namespace);
+
+        if map.map_layer(&layer).is_err() {
+            eprintln!("vanta-comp: failed to map layer surface");
+        }
+    }
+
+    fn layer_destroyed(&mut self, surface: WlrLayerSurface) {
+        if let Some((mut map, layer)) = self.space.outputs().find_map(|output| {
+            let map = layer_map_for_output(output);
+
+            let layer = map
+                .layers()
+                .find(|layer| layer.layer_surface() == &surface)
+                .cloned();
+
+            layer.map(|layer| (map, layer))
+        }) {
+            map.unmap_layer(&layer);
+        }
+    }
+}
 
 smithay::delegate_dispatch2!(Vanta);
