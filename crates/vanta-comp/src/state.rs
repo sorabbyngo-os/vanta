@@ -4,10 +4,16 @@ use std::{
     sync::Arc,
 };
 
-use vanta_ipc::{Action, ActionResult, MinimizedWindowInfo, Request, RequestStatus, Response, PROTOCOL_VERSION};
+use vanta_ipc::{
+    Action, ActionResult, MinimizedWindowInfo, OverviewWindowInfo, OverviewWorkspaceInfo, Request,
+    RequestStatus, Response, PROTOCOL_VERSION,
+};
 
 use smithay::{
-    backend::renderer::element::solid::SolidColorBuffer,
+    backend::{
+        allocator::Fourcc,
+        renderer::element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
+    },
     desktop::{PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState},
     output::Output,
@@ -40,6 +46,70 @@ pub struct MinimizedWindowState {
     pub app_id: Option<String>,
 }
 
+/// Build a reusable translucent glass texture for overview cards.
+pub(crate) fn create_overview_glass_buffer() -> MemoryRenderBuffer {
+    const WIDTH: i32 = 256;
+    const HEIGHT: i32 = 160;
+    const RADIUS: f32 = 18.0;
+
+    let mut buffer = MemoryRenderBuffer::new(
+        Fourcc::Argb8888,
+        (WIDTH, HEIGHT),
+        1,
+        smithay::utils::Transform::Normal,
+        None,
+    );
+
+    let _ = buffer.render().draw(|pixels| {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let px = x as f32;
+                let py = y as f32;
+                let cx = px.clamp(RADIUS, WIDTH as f32 - RADIUS);
+                let cy = py.clamp(RADIUS, HEIGHT as f32 - RADIUS);
+                let dx = px - cx;
+                let dy = py - cy;
+                let distance = (dx * dx + dy * dy).sqrt();
+
+                if distance > RADIUS {
+                    continue;
+                }
+
+                let vertical = y as f32 / HEIGHT as f32;
+                let top_glow = (1.0 - vertical * 3.2).clamp(0.0, 1.0);
+                let edge = if distance > RADIUS - 1.4 { 1.0 } else { 0.0 };
+
+                let alpha = (92.0 + 20.0 * (1.0 - vertical) + 22.0 * top_glow + 24.0 * edge)
+                    .clamp(0.0, 160.0);
+
+                let red = 91.0 + 28.0 * top_glow + 35.0 * edge;
+                let green = 126.0 + 34.0 * top_glow + 42.0 * edge;
+                let blue = 166.0 + 42.0 * top_glow + 52.0 * edge;
+
+                let offset = ((y * WIDTH + x) * 4) as usize;
+                let a = alpha / 255.0;
+
+                // ARGB8888 is stored as BGRA bytes on little-endian systems.
+                pixels[offset] = (blue * a).round() as u8;
+                pixels[offset + 1] = (green * a).round() as u8;
+                pixels[offset + 2] = (red * a).round() as u8;
+                pixels[offset + 3] = alpha.round() as u8;
+            }
+        }
+
+        Ok::<_, ()>(vec![Rectangle::from_size((WIDTH, HEIGHT).into())])
+    });
+
+    buffer
+}
+
+/// Shared geometry for the Strip overview, used by both rendering and input.
+pub(crate) struct OverviewLayout {
+    pub thumbnails: Vec<(u32, Rectangle<i32, Logical>)>,
+    pub active_preview: Rectangle<i32, Logical>,
+    pub new_workspace: Rectangle<i32, Logical>,
+}
+
 pub struct Vanta {
     pub start_time: std::time::Instant,
     pub socket_name: OsString,
@@ -51,9 +121,20 @@ pub struct Vanta {
     pub(crate) snap_preview_buffer: SolidColorBuffer,
     pub(crate) minimize_preview: Option<Rectangle<i32, Logical>>,
     pub(crate) minimize_preview_buffer: SolidColorBuffer,
+    pub(crate) overview_card_buffers: Vec<MemoryRenderBuffer>,
+    pub(crate) overview_active_buffer: MemoryRenderBuffer,
+    pub(crate) overview_new_buffer: MemoryRenderBuffer,
+    pub(crate) overview_plus_buffer: SolidColorBuffer,
+    pub(crate) overview_plus_vertical_buffer: SolidColorBuffer,
     pub(crate) floating_windows: HashSet<u64>,
     pub(crate) layout_sizes: HashMap<u64, Size<i32, Logical>>,
     pub(crate) minimized_windows: HashMap<u64, MinimizedWindowState>,
+    pub(crate) workspace_count: u32,
+    pub(crate) active_workspace: u32,
+    pub(crate) overview_open: bool,
+    pub(crate) hot_corner_armed: bool,
+    pub(crate) window_workspaces: HashMap<u64, u32>,
+    pub(crate) window_locations: HashMap<u64, Point<i32, Logical>>,
     /// Vanta-assigned stable IDs mapped to Smithay window handles.
     pub windows: HashMap<u64, Window>,
     window_ids: WindowIdAllocator,
@@ -118,9 +199,20 @@ impl Vanta {
         let snap_preview_buffer = SolidColorBuffer::new((0, 0), [0.20, 0.48, 0.95, 0.24]);
         let minimize_preview = None;
         let minimize_preview_buffer = SolidColorBuffer::new((0, 0), [0.95, 0.62, 0.16, 0.32]);
+        let overview_card_buffers = Vec::new();
+        let overview_active_buffer = create_overview_glass_buffer();
+        let overview_new_buffer = create_overview_glass_buffer();
+        let overview_plus_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
+        let overview_plus_vertical_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
         let floating_windows = HashSet::new();
         let layout_sizes = HashMap::new();
         let minimized_windows = HashMap::new();
+        let workspace_count = 1;
+        let active_workspace = 0;
+        let overview_open = false;
+        let hot_corner_armed = false;
+        let window_workspaces = HashMap::new();
+        let window_locations = HashMap::new();
         let windows = HashMap::new();
         let window_ids = WindowIdAllocator::default();
 
@@ -140,9 +232,20 @@ impl Vanta {
             snap_preview_buffer,
             minimize_preview,
             minimize_preview_buffer,
+            overview_card_buffers,
+            overview_active_buffer,
+            overview_new_buffer,
+            overview_plus_buffer,
+            overview_plus_vertical_buffer,
             floating_windows,
             layout_sizes,
             minimized_windows,
+            workspace_count,
+            active_workspace,
+            overview_open,
+            hot_corner_armed,
+            window_workspaces,
+            window_locations,
             windows,
             window_ids,
             loop_signal,
@@ -205,8 +308,148 @@ impl Vanta {
     /// Register a newly created window and return its stable Vanta ID.
     pub fn register_window(&mut self, window: Window) -> Option<u64> {
         let id = self.window_ids.allocate()?;
+        self.window_workspaces.insert(id, self.active_workspace);
+        self.window_locations.insert(id, (0, 0).into());
         self.windows.insert(id, window);
         Some(id)
+    }
+
+    /// Return the current workspace count and active workspace index.
+    pub fn workspace_state(&self) -> (u32, u32) {
+        (self.workspace_count, self.active_workspace)
+    }
+
+    /// Calculate the shared Strip overview geometry for rendering and hit-testing.
+    pub(crate) fn overview_layout(&self) -> Option<OverviewLayout> {
+        let output = self.output.as_ref()?;
+        let geometry = self.space.output_geometry(output)?;
+
+        let margin = 48_i32;
+        let strip_y = geometry.loc.y + 72;
+        let strip_height = 96_i32;
+        let strip_gap = 12_i32;
+        let available_width = (geometry.size.w - margin * 2).max(1);
+        let slot_count = self.workspace_count.saturating_add(1).max(2) as i32;
+        let thumbnail_width =
+            ((available_width - strip_gap * (slot_count - 1)) / slot_count).clamp(64, 260);
+        let thumbnail_height = 76_i32;
+        let total_strip_width = slot_count * thumbnail_width + (slot_count - 1) * strip_gap;
+        let strip_start_x = geometry.loc.x + (geometry.size.w - total_strip_width).max(0) / 2;
+        let thumbnail_y = strip_y + (strip_height - thumbnail_height) / 2;
+
+        let mut thumbnails = Vec::with_capacity(self.workspace_count as usize);
+
+        for index in 0..self.workspace_count {
+            let x = strip_start_x + index as i32 * (thumbnail_width + strip_gap);
+            thumbnails.push((
+                index,
+                Rectangle::new(
+                    (x, thumbnail_y).into(),
+                    (thumbnail_width, thumbnail_height).into(),
+                ),
+            ));
+        }
+
+        let new_x = strip_start_x + self.workspace_count as i32 * (thumbnail_width + strip_gap);
+        let new_workspace = Rectangle::new(
+            (new_x, thumbnail_y).into(),
+            (thumbnail_width, thumbnail_height).into(),
+        );
+
+        let preview_top = strip_y + strip_height + 32;
+        let preview_bottom_margin = 104;
+        let active_preview = Rectangle::new(
+            (geometry.loc.x + margin, geometry.loc.y + preview_top).into(),
+            (
+                (geometry.size.w - margin * 2).max(1),
+                (geometry.size.h - preview_top - preview_bottom_margin).max(1),
+            )
+                .into(),
+        );
+
+        Some(OverviewLayout {
+            thumbnails,
+            active_preview,
+            new_workspace,
+        })
+    }
+
+    /// Switch to an existing workspace, preserving each window's last location.
+    pub fn switch_workspace(&mut self, index: u32) -> Result<(), String> {
+        if index >= self.workspace_count {
+            return Err(format!(
+                "Workspace {index} does not exist (workspace count: {})",
+                self.workspace_count
+            ));
+        }
+
+        if index == self.active_workspace {
+            return Ok(());
+        }
+
+        let current_windows: Vec<Window> = self.space.elements().cloned().collect();
+
+        for window in &current_windows {
+            if let Some(id) = self
+                .windows
+                .iter()
+                .find_map(|(id, candidate)| (candidate == window).then_some(*id))
+            {
+                if let Some(location) = self.space.element_location(window) {
+                    self.window_locations.insert(id, location);
+                }
+            }
+        }
+
+        self.clear_focus_with_serial(SERIAL_COUNTER.next_serial())?;
+
+        for window in current_windows {
+            self.space.unmap_elem(&window);
+        }
+
+        self.active_workspace = index;
+
+        let mut destination: Vec<(u64, Window)> = self
+            .windows
+            .iter()
+            .filter(|(id, window)| {
+                self.window_workspaces.get(id) == Some(&index)
+                    && !self.minimized_windows.contains_key(id)
+                    && window.alive()
+            })
+            .map(|(id, window)| (*id, window.clone()))
+            .collect();
+
+        destination.sort_by_key(|(id, _)| *id);
+
+        for (id, window) in destination {
+            let location = self
+                .window_locations
+                .get(&id)
+                .copied()
+                .unwrap_or_else(|| (0, 0).into());
+            self.space.map_element(window, location, false);
+        }
+
+        self.layout_sizes.clear();
+        self.relayout_windows();
+        Ok(())
+    }
+
+    /// Create a workspace and activate it.
+    pub fn create_workspace(&mut self) -> Result<(), String> {
+        let index = self.workspace_count;
+        self.workspace_count = self
+            .workspace_count
+            .checked_add(1)
+            .ok_or_else(|| "Workspace count limit reached".to_owned())?;
+
+        if let Err(error) = self.switch_workspace(index) {
+            self.workspace_count -= 1;
+            return Err(error);
+        }
+
+        Ok(())
     }
 
     /// Raise a window while preserving the floating-above-tiled stacking policy.
@@ -319,21 +562,29 @@ impl Vanta {
             return Err(format!("Window {id} is already minimized"));
         }
 
-        let window = self.windows.get(&id).cloned()
+        let window = self
+            .windows
+            .get(&id)
+            .cloned()
             .ok_or_else(|| format!("Unknown window ID: {id}"))?;
 
         if !window.alive() {
             return Err(format!("Window {id} is no longer alive"));
         }
 
-        let location = self.space.element_location(&window)
+        let location = self
+            .space
+            .element_location(&window)
             .ok_or_else(|| format!("Window {id} is not currently mapped"))?;
 
-        let size = self.space.element_geometry(&window)
+        let size = self
+            .space
+            .element_geometry(&window)
             .map(|geometry| geometry.size)
             .unwrap_or_else(|| window.geometry().size);
 
-        let surface = window.toplevel()
+        let surface = window
+            .toplevel()
             .filter(|toplevel| toplevel.alive())
             .map(|toplevel| toplevel.wl_surface().clone())
             .ok_or_else(|| format!("Window {id} has no live toplevel surface"))?;
@@ -343,11 +594,14 @@ impl Vanta {
                 let role = data.lock().unwrap();
                 (role.title.clone(), role.app_id.clone())
             })
-        }).unwrap_or((None, None));
+        })
+        .unwrap_or((None, None));
 
         let was_floating = self.floating_windows.contains(&id);
 
-        let keyboard = self.seat.get_keyboard()
+        let keyboard = self
+            .seat
+            .get_keyboard()
             .ok_or_else(|| "No keyboard is available on the Vanta seat".to_string())?;
 
         let had_keyboard_focus = keyboard.current_focus().as_ref() == Some(&surface);
@@ -361,16 +615,20 @@ impl Vanta {
             keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
         }
 
+        self.window_locations.insert(id, location);
         self.space.unmap_elem(&window);
         self.layout_sizes.remove(&id);
 
-        self.minimized_windows.insert(id, MinimizedWindowState {
-            location,
-            size,
-            was_floating,
-            title,
-            app_id,
-        });
+        self.minimized_windows.insert(
+            id,
+            MinimizedWindowState {
+                location,
+                size,
+                was_floating,
+                title,
+                app_id,
+            },
+        );
 
         self.relayout_windows();
         Ok(())
@@ -378,10 +636,16 @@ impl Vanta {
 
     /// Restore the original live window handle and its saved geometry.
     pub fn restore_window(&mut self, id: u64) -> Result<(), String> {
-        let saved = self.minimized_windows.get(&id).cloned()
+        let saved = self
+            .minimized_windows
+            .get(&id)
+            .cloned()
             .ok_or_else(|| format!("Window {id} is not minimized"))?;
 
-        let window = self.windows.get(&id).cloned()
+        let window = self
+            .windows
+            .get(&id)
+            .cloned()
             .ok_or_else(|| format!("Unknown window ID: {id}"))?;
 
         if !window.alive() {
@@ -392,11 +656,20 @@ impl Vanta {
             return Err(format!("Window {id} is already mapped"));
         }
 
-        let toplevel = window.toplevel()
+        let toplevel = window
+            .toplevel()
             .filter(|toplevel| toplevel.alive())
             .ok_or_else(|| format!("Window {id} has no live toplevel surface"))?;
 
+        let workspace = self
+            .window_workspaces
+            .get(&id)
+            .copied()
+            .ok_or_else(|| format!("Window {id} has no workspace assignment"))?;
+
+        self.switch_workspace(workspace)?;
         self.space.map_element(window.clone(), saved.location, true);
+        self.window_locations.insert(id, saved.location);
 
         if saved.was_floating {
             self.floating_windows.insert(id);
@@ -420,9 +693,72 @@ impl Vanta {
         self.focus_window(id)
     }
 
+    /// Build a deterministic overview snapshot for every workspace.
+    ///
+    /// Live windows are read from their XDG toplevel metadata. Minimized
+    /// windows use the metadata captured before they were unmapped.
+    pub fn overview_data(&self) -> (Vec<OverviewWorkspaceInfo>, u32) {
+        let mut workspaces = Vec::with_capacity(self.workspace_count as usize);
+
+        for index in 0..self.workspace_count {
+            let mut ids: Vec<u64> = self
+                .window_workspaces
+                .iter()
+                .filter_map(|(id, workspace)| (*workspace == index).then_some(*id))
+                .collect();
+            ids.sort_unstable();
+
+            let mut windows = Vec::with_capacity(ids.len());
+
+            for id in ids {
+                if let Some(minimized) = self.minimized_windows.get(&id) {
+                    windows.push(OverviewWindowInfo {
+                        id,
+                        title: minimized.title.clone(),
+                        app_id: minimized.app_id.clone(),
+                        minimized: true,
+                    });
+                    continue;
+                }
+
+                let Some(window) = self.windows.get(&id).filter(|window| window.alive()) else {
+                    continue;
+                };
+
+                let Some(surface) = window
+                    .toplevel()
+                    .filter(|toplevel| toplevel.alive())
+                    .map(|toplevel| toplevel.wl_surface().clone())
+                else {
+                    continue;
+                };
+
+                let (title, app_id) = with_states(&surface, |states| {
+                    states.data_map.get::<XdgToplevelSurfaceData>().map(|data| {
+                        let role = data.lock().unwrap();
+                        (role.title.clone(), role.app_id.clone())
+                    })
+                })
+                .unwrap_or((None, None));
+
+                windows.push(OverviewWindowInfo {
+                    id,
+                    title,
+                    app_id,
+                    minimized: false,
+                });
+            }
+
+            workspaces.push(OverviewWorkspaceInfo { index, windows });
+        }
+
+        (workspaces, self.active_workspace)
+    }
+
     /// Return minimized windows in stable ID order for shell thumbnail rendering.
     pub fn list_minimized_windows(&self) -> Vec<MinimizedWindowInfo> {
-        let mut windows: Vec<MinimizedWindowInfo> = self.minimized_windows
+        let mut windows: Vec<MinimizedWindowInfo> = self
+            .minimized_windows
             .iter()
             .map(|(id, state)| MinimizedWindowInfo {
                 id: *id,
@@ -462,10 +798,12 @@ impl Vanta {
 
     /// Remove a destroyed toplevel from the registry and visible space.
     pub fn unregister_window_for_surface(&mut self, surface: &WlSurface) {
-        let removed_ids: Vec<u64> = self.windows
+        let removed_ids: Vec<u64> = self
+            .windows
             .iter()
             .filter_map(|(id, window)| {
-                window.toplevel()
+                window
+                    .toplevel()
                     .is_some_and(|toplevel| toplevel.wl_surface() == surface)
                     .then_some(*id)
             })
@@ -475,16 +813,22 @@ impl Vanta {
             self.minimized_windows.remove(id);
             self.floating_windows.remove(id);
             self.layout_sizes.remove(id);
+            self.window_workspaces.remove(id);
+            self.window_locations.remove(id);
         }
 
         self.windows.retain(|_, window| {
-            !window.toplevel()
+            !window
+                .toplevel()
                 .is_some_and(|toplevel| toplevel.wl_surface() == surface)
         });
 
-        let window_to_unmap = self.space.elements()
+        let window_to_unmap = self
+            .space
+            .elements()
             .find(|window| {
-                window.toplevel()
+                window
+                    .toplevel()
                     .is_some_and(|toplevel| toplevel.wl_surface() == surface)
             })
             .cloned();
@@ -550,12 +894,55 @@ impl Vanta {
                 },
             ),
 
-            Action::SwitchWorkspace { .. } => response(
-                RequestStatus::Rejected,
-                ActionResult::Err {
-                    message: "SwitchWorkspace is not implemented yet".to_owned(),
-                },
-            ),
+            Action::ListWorkspaces => {
+                let (count, active_index) = self.workspace_state();
+                response(
+                    RequestStatus::Completed,
+                    ActionResult::Workspaces {
+                        count,
+                        active_index,
+                    },
+                )
+            }
+
+            Action::GetOverviewData => {
+                let (workspaces, active_index) = self.overview_data();
+                response(
+                    RequestStatus::Completed,
+                    ActionResult::OverviewData {
+                        workspaces,
+                        active_index,
+                    },
+                )
+            }
+
+            Action::CreateWorkspace => match self.create_workspace() {
+                Ok(()) => {
+                    let (count, active_index) = self.workspace_state();
+                    response(
+                        RequestStatus::Completed,
+                        ActionResult::Workspaces {
+                            count,
+                            active_index,
+                        },
+                    )
+                }
+                Err(message) => response(RequestStatus::Rejected, ActionResult::Err { message }),
+            },
+
+            Action::SwitchWorkspace { index } => match self.switch_workspace(index) {
+                Ok(()) => {
+                    let (count, active_index) = self.workspace_state();
+                    response(
+                        RequestStatus::Completed,
+                        ActionResult::Workspaces {
+                            count,
+                            active_index,
+                        },
+                    )
+                }
+                Err(message) => response(RequestStatus::Rejected, ActionResult::Err { message }),
+            },
 
             Action::RequestIntent { .. } => response(
                 RequestStatus::Rejected,

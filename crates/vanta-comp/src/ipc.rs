@@ -209,6 +209,13 @@ fn write_response(mut stream: UnixStream, response: Response) -> io::Result<()> 
     let encoded = serde_json::to_vec(&response)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
+    if encoded.len() + 1 > MAX_FRAME_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "IPC response exceeds the maximum frame size",
+        ));
+    }
+
     stream.write_all(&encoded)?;
     stream.write_all(b"\n")?;
     stream.flush()

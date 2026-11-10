@@ -31,8 +31,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // than the host compositor
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
 
-    // Spawn a test client, that will run under Vanta
-    spawn_client();
+    // Launch the native shell inside this nested Wayland session.
+    spawn_shell();
 
     event_loop.run(None, &mut state, move |_| {
         // Vanta is running
@@ -49,17 +49,30 @@ fn init_logging() {
     }
 }
 
-fn spawn_client() {
-    let mut args = std::env::args().skip(1);
-    let flag = args.next();
-    let arg = args.next();
+fn spawn_shell() {
+    let shell_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|dir| dir.join("vanta-shell")));
 
-    match (flag.as_deref(), arg) {
-        (Some("-c") | Some("--command"), Some(command)) => {
-            std::process::Command::new(command).spawn().ok();
+    let Some(shell_path) = shell_path else {
+        eprintln!("vanta-comp: cannot determine the shell executable path");
+        return;
+    };
+
+    if !shell_path.is_file() {
+        eprintln!(
+            "vanta-comp: shell executable not found at {}; build with cargo build -p vanta-shell",
+            shell_path.display()
+        );
+        return;
+    }
+
+    match std::process::Command::new(&shell_path).spawn() {
+        Ok(child) => {
+            eprintln!("vanta-comp: started vanta-shell (pid {})", child.id());
         }
-        _ => {
-            std::process::Command::new("weston-terminal").spawn().ok();
+        Err(error) => {
+            eprintln!("vanta-comp: failed to start vanta-shell: {error}");
         }
     }
 }

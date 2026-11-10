@@ -127,10 +127,17 @@ impl WlrLayerShellHandler for Vanta {
         };
 
         let mut map = layer_map_for_output(&output);
-        let layer = LayerSurface::new(surface, namespace);
+        let layer = LayerSurface::new(surface, namespace.clone());
 
         if map.map_layer(&layer).is_err() {
             eprintln!("vanta-comp: failed to map layer surface");
+        } else {
+            let output_geometry = self.space.output_geometry(&output);
+            let layer_geometry = map.layer_geometry(&layer);
+
+            eprintln!(
+                "vanta-comp: layer={namespace} output={output_geometry:?} mapped={layer_geometry:?}"
+            );
         }
     }
 

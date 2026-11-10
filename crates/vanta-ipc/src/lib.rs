@@ -100,6 +100,9 @@ pub enum Action {
         id: u64,
     },
     ListMinimizedWindows,
+    ListWorkspaces,
+    GetOverviewData,
+    CreateWorkspace,
     SwitchWorkspace {
         index: u32,
     },
@@ -117,14 +120,42 @@ pub struct MinimizedWindowInfo {
     pub app_id: Option<String>,
 }
 
+/// A live or minimized window represented in an overview snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverviewWindowInfo {
+    pub id: u64,
+    pub title: Option<String>,
+    pub app_id: Option<String>,
+    pub minimized: bool,
+}
+
+/// Window metadata for one workspace, including empty workspaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverviewWorkspaceInfo {
+    pub index: u32,
+    pub windows: Vec<OverviewWindowInfo>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionResult {
     Ok,
     MinimizedWindows {
         windows: Vec<MinimizedWindowInfo>,
     },
-    NeedConfirm { reason: String },
-    Err { message: String },
+    Workspaces {
+        count: u32,
+        active_index: u32,
+    },
+    OverviewData {
+        workspaces: Vec<OverviewWorkspaceInfo>,
+        active_index: u32,
+    },
+    NeedConfirm {
+        reason: String,
+    },
+    Err {
+        message: String,
+    },
 }
 
 #[cfg(test)]
@@ -218,6 +249,9 @@ mod action_tests {
             Action::MinimizeWindow { id: 9 },
             Action::RestoreWindow { id: 9 },
             Action::ListMinimizedWindows,
+            Action::ListWorkspaces,
+            Action::GetOverviewData,
+            Action::CreateWorkspace,
             Action::SwitchWorkspace { index: 3 },
             Action::RequestIntent {
                 text: "Open workspace two".to_owned(),
@@ -241,6 +275,28 @@ mod action_tests {
                     title: Some("Terminal".to_owned()),
                     app_id: Some("org.example.Terminal".to_owned()),
                 }],
+            },
+            ActionResult::Workspaces {
+                count: 4,
+                active_index: 2,
+            },
+            ActionResult::OverviewData {
+                workspaces: vec![
+                    OverviewWorkspaceInfo {
+                        index: 0,
+                        windows: vec![OverviewWindowInfo {
+                            id: 42,
+                            title: Some("Terminal".to_owned()),
+                            app_id: Some("org.example.Terminal".to_owned()),
+                            minimized: false,
+                        }],
+                    },
+                    OverviewWorkspaceInfo {
+                        index: 1,
+                        windows: Vec::new(),
+                    },
+                ],
+                active_index: 0,
             },
             ActionResult::NeedConfirm {
                 reason: "Closing this window".to_owned(),
@@ -350,6 +406,14 @@ impl Response {
                 | (
                     RequestStatus::Completed,
                     Some(ActionResult::MinimizedWindows { .. })
+                )
+                | (
+                    RequestStatus::Completed,
+                    Some(ActionResult::Workspaces { .. })
+                )
+                | (
+                    RequestStatus::Completed,
+                    Some(ActionResult::OverviewData { .. })
                 )
                 | (
                     RequestStatus::Rejected,

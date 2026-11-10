@@ -1,6 +1,7 @@
 use crate::{grabs::resize_grab, state::ClientState, Vanta};
 use smithay::{
     backend::renderer::utils::on_commit_buffer_handler,
+    desktop::layer_map_for_output,
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_surface::WlSurface},
         Client,
@@ -11,6 +12,7 @@ use smithay::{
             get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler,
             CompositorState,
         },
+        shell::wlr_layer::WlrLayerShellHandler,
         shm::{ShmHandler, ShmState},
     },
 };
@@ -28,6 +30,28 @@ impl CompositorHandler for Vanta {
 
     fn commit(&mut self, surface: &WlSurface) {
         on_commit_buffer_handler::<Self>(surface);
+
+        let layer_surface = self
+            .shell_state()
+            .layer_surfaces()
+            .find(|layer| layer.wl_surface() == surface);
+
+        if let Some(layer_surface) = layer_surface {
+            layer_surface.send_pending_configure();
+
+            for output in self.space.outputs() {
+                let mut map = layer_map_for_output(output);
+
+                let layer = map
+                    .layers()
+                    .find(|layer| layer.layer_surface() == &layer_surface)
+                    .cloned();
+
+                if let Some(layer) = layer {
+                    map.arrange();
+                }
+            }
+        }
         if !is_sync_subsurface(surface) {
             let mut root = surface.clone();
             while let Some(parent) = get_parent(&root) {

@@ -57,21 +57,23 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
                 .as_ref()
                 .and_then(|output| data.space.output_geometry(output))
                 .and_then(|output_geometry| {
-                    data.space.element_bbox(&self.window).and_then(|window_bounds| {
-                        let window_bottom = window_bounds.loc.y + window_bounds.size.h;
-                        let output_bottom = output_geometry.loc.y + output_geometry.size.h;
+                    data.space
+                        .element_bbox(&self.window)
+                        .and_then(|window_bounds| {
+                            let window_bottom = window_bounds.loc.y + window_bounds.size.h;
+                            let output_bottom = output_geometry.loc.y + output_geometry.size.h;
 
-                        (window_bottom >= output_bottom - MINIMIZE_THRESHOLD).then(|| {
-                            Rectangle::new(
-                                (
-                                    output_bottom - MINIMIZE_PREVIEW_SIZE.0 - 16,
-                                    output_bottom - MINIMIZE_PREVIEW_SIZE.1 - 16,
+                            (window_bottom >= output_bottom - MINIMIZE_THRESHOLD).then(|| {
+                                Rectangle::new(
+                                    (
+                                        output_bottom - MINIMIZE_PREVIEW_SIZE.0 - 16,
+                                        output_bottom - MINIMIZE_PREVIEW_SIZE.1 - 16,
+                                    )
+                                        .into(),
+                                    MINIMIZE_PREVIEW_SIZE.into(),
                                 )
-                                    .into(),
-                                MINIMIZE_PREVIEW_SIZE.into(),
-                            )
+                            })
                         })
-                    })
                 })
         } else {
             None
@@ -135,7 +137,9 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
 
         if !handle.current_pressed().contains(&BTN_LEFT) {
             if self.minimize_target {
-                let window_id = data.windows.iter()
+                let window_id = data
+                    .windows
+                    .iter()
                     .find_map(|(id, window)| (window == &self.window).then_some(*id));
 
                 if let Some(id) = window_id {

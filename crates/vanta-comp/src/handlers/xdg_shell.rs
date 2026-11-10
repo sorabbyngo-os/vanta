@@ -39,8 +39,9 @@ impl XdgShellHandler for Vanta {
         if self.register_window(window.clone()).is_none() {
             tracing::error!(
                 smithay_window_id = window.id(),
-                "Vanta window ID space exhausted; window will not be registered"
+                "Vanta window ID space exhausted; refusing to map unregistered window"
             );
+            return;
         }
 
         self.space.map_element(window, (0, 0), false);
