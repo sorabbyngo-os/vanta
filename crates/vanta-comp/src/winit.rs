@@ -135,6 +135,8 @@ pub fn init_winit(
         .insert_source(winit, move |event, _, state| {
             match event {
                 WinitEvent::Resized { size, .. } => {
+                    // Update the output geometry before recalculating
+                    // layer-shell and window positions.
                     output.change_current_state(
                         Some(Mode {
                             size,
@@ -144,6 +146,16 @@ pub fn init_winit(
                         None,
                         None,
                     );
+
+                    // Recalculate panel, dock, and other layer surfaces
+                    // against the new output dimensions.
+                    {
+                        let mut layer_map =
+                            smithay::desktop::layer_map_for_output(&output);
+                        layer_map.arrange();
+                    }
+
+                    // Recalculate window layouts using the updated geometry.
                     state.relayout_windows();
                 }
                 WinitEvent::Input(event) => state.process_input_event(event),
@@ -188,20 +200,33 @@ pub fn init_winit(
                         }
 
                         if let Some(preview) = state.minimize_preview {
-                            state.minimize_preview_buffer.resize(preview.size);
-                            custom_elements.push(
-                                SolidColorRenderElement::from_buffer(
-                                    &state.minimize_preview_buffer,
-                                    preview.loc.to_physical_precise_round(scale),
-                                    scale,
-                                    1.0,
-                                    Kind::Unspecified,
-                                )
-                                .into(),
-                            );
+                            if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                preview.loc.to_physical_precise_round(scale),
+                                &state.minimize_preview_buffer,
+                                None,
+                                None,
+                                Some(preview.size),
+                                Kind::Unspecified,
+                            ) {
+                                custom_elements.push(element.into());
+                            }
                         }
 
                         if state.overview_open {
+                            if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                Point::<i32, Logical>::from((12, 12))
+                                    .to_physical_precise_round(scale),
+                                &state.overview_indicator_buffer,
+                                None,
+                                Some(Rectangle::from_size((128.0, 20.0).into())),
+                                Some((128, 20).into()),
+                                Kind::Unspecified,
+                            ) {
+                                custom_elements.push(element.into());
+                            }
+
                             if let Some(layout) = state.overview_layout() {
                                 while state.overview_card_buffers.len() < layout.thumbnails.len() {
                                     state.overview_card_buffers.push(create_overview_glass_buffer());
@@ -224,18 +249,6 @@ pub fn init_winit(
                                         &mut state.overview_card_buffers[workspace as usize]
                                     };
 
-                                    if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
-                                        renderer,
-                                        rect.loc.to_physical_precise_round(scale),
-                                        buffer,
-                                        None,
-                                        None,
-                                        Some(rect.size),
-                                        Kind::Unspecified,
-                                    ) {
-                                        custom_elements.push(element.into());
-                                    }
-
                                     let inset = if is_main_preview { 16 } else { 5 };
                                     let reserved_height = if is_main_preview { 38 } else { 12 };
                                     let preview: Rectangle<i32, Logical> = Rectangle::new(
@@ -247,59 +260,123 @@ pub fn init_winit(
                                             .into(),
                                     );
 
-                                    let mut windows: Vec<(u64, smithay::desktop::Window)> =
-                                        state.windows.iter()
-                                            .filter(|(id, window)| {
-                                                state.window_workspaces.get(id) == Some(&workspace)
-                                                    && !state.minimized_windows.contains_key(id)
-                                                    && window.alive()
-                                            })
-                                            .map(|(id, window)| (*id, window.clone()))
-                                            .collect();
-                                    windows.sort_by_key(|(id, _)| *id);
+                                    // Build a miniature of the real workspace.
+                                    // Every window uses the same scale and offset, preserving
+                                    // desktop geometry, aspect ratio and relative placement.
+                                    let mut windows: Vec<(
+                                        u64,
+                                        smithay::desktop::Window,
+                                        Point<i32, Logical>,
+                                        Rectangle<i32, Logical>,
+                                    )> = state.windows.iter()
+                                        .filter(|(id, window)| {
+                                            state.window_workspaces.get(id) == Some(&workspace)
+                                                && window.alive()
+                                        })
+                                        .filter_map(|(id, window)| {
+                                            let location = state.space.element_location(window)
+                                                .or_else(|| state.window_locations.get(id).copied())?;
+                                            // Match the exact reference used by
+                                            // constrain_space_element: the window bounding
+                                            // box, including subsurfaces and popups.
+                                            let geometry = window.geometry();
+                                            let bbox = window.bbox_with_popups();
 
-                                    let count = windows.len();
-                                    if count > 0 {
-                                        let columns = (count as f64).sqrt().ceil() as usize;
-                                        let rows = count.div_ceil(columns);
-                                        let cell_width =
-                                            (preview.size.w / columns as i32).max(1);
-                                        let cell_height =
-                                            (preview.size.h / rows as i32).max(1);
-
-                                        for (index, (id, window)) in
-                                            windows.into_iter().enumerate()
-                                        {
-                                            let column = index % columns;
-                                            let row = index / columns;
-                                            let cell = Rectangle::new(
-                                                (
-                                                    preview.loc.x + column as i32 * cell_width,
-                                                    preview.loc.y + row as i32 * cell_height,
-                                                )
-                                                    .into(),
-                                                (
-                                                    if column + 1 == columns {
-                                                        preview.size.w - column as i32 * cell_width
-                                                    } else {
-                                                        cell_width
-                                                    }
-                                                    .max(1),
-                                                    if row + 1 == rows {
-                                                        preview.size.h - row as i32 * cell_height
-                                                    } else {
-                                                        cell_height
-                                                    }
-                                                    .max(1),
-                                                )
-                                                    .into(),
+                                            // Space locations identify the geometry origin.
+                                            // The render helper needs the bounding-box origin.
+                                            let bounds = Rectangle::new(
+                                                location + bbox.loc - geometry.loc,
+                                                bbox.size,
                                             );
-                                            let location = state.window_locations
-                                                .get(&id)
-                                                .copied()
-                                                .unwrap_or_else(|| (0, 0).into());
 
-                                            custom_elements.extend(
+                                            Some((*id, window.clone(), location, bounds))
+                                        })
+                                        .collect();
+
+                                    // Stable fallback ordering for unmapped workspaces.
+                                    windows.sort_by_key(|(id, _, _, _)| *id);
+
+                                    // Space::elements() is ordered back-to-front. Use that
+                                    // order for the currently mapped workspace.
+                                    let stacking: Vec<smithay::desktop::Window> =
+                                        state.space.elements().cloned().collect();
+                                    windows.sort_by_key(|(_, window, _, _)| {
+                                        stacking.iter().position(|candidate| candidate == window)
+                                            .unwrap_or(usize::MAX)
+                                    });
+
+                                    let discovered_windows = windows.len();
+                                    let mut preview_render_elements = 0usize;
+
+                                    if !windows.is_empty() {
+                                        let min_x = windows.iter()
+                                            .map(|(_, _, _, bounds)| bounds.loc.x)
+                                            .min().unwrap();
+                                        let min_y = windows.iter()
+                                            .map(|(_, _, _, bounds)| bounds.loc.y)
+                                            .min().unwrap();
+                                        let max_x = windows.iter()
+                                            .map(|(_, _, _, bounds)| bounds.loc.x + bounds.size.w)
+                                            .max().unwrap();
+                                        let max_y = windows.iter()
+                                            .map(|(_, _, _, bounds)| bounds.loc.y + bounds.size.h)
+                                            .max().unwrap();
+
+                                        let workspace_width = (max_x - min_x).max(1);
+                                        let workspace_height = (max_y - min_y).max(1);
+
+                                        let uniform_scale = (
+                                            preview.size.w as f64 / workspace_width as f64
+                                        ).min(
+                                            preview.size.h as f64 / workspace_height as f64
+                                        );
+
+                                        let rendered_width =
+                                            (workspace_width as f64 * uniform_scale).round() as i32;
+                                        let rendered_height =
+                                            (workspace_height as f64 * uniform_scale).round() as i32;
+
+                                        let offset_x =
+                                            preview.loc.x + (preview.size.w - rendered_width) / 2;
+                                        let offset_y =
+                                            preview.loc.y + (preview.size.h - rendered_height) / 2;
+
+                                        for (_, window, location, bounds) in windows {
+                                            let target = Rectangle::new(
+                                                (
+                                                    offset_x + ((bounds.loc.x - min_x) as f64
+                                                        * uniform_scale).round() as i32,
+                                                    offset_y + ((bounds.loc.y - min_y) as f64
+                                                        * uniform_scale).round() as i32,
+                                                ).into(),
+                                                (
+                                                    ((bounds.size.w as f64 * uniform_scale)
+                                                        .round() as i32).max(1),
+                                                    ((bounds.size.h as f64 * uniform_scale)
+                                                        .round() as i32).max(1),
+                                                ).into(),
+                                            );
+
+                                            let raw_preview_elements: Vec<
+                                                WaylandSurfaceRenderElement<GlesRenderer>,
+                                            > = AsRenderElements::render_elements(
+                                                &window,
+                                                renderer,
+                                                location.to_physical_precise_round(scale),
+                                                scale.into(),
+                                                1.0,
+                                            );
+
+                                            eprintln!(
+                                                "[VANTA-RAW-PREVIEW] raw_elements={} location={:?} scale={:?}",
+                                                raw_preview_elements.len(),
+                                                location,
+                                                scale,
+                                            );
+
+                                            drop(raw_preview_elements);
+
+                                            let preview_elements: Vec<_> =
                                                 smithay::desktop::space::constrain_space_element::<
                                                     GlesRenderer,
                                                     smithay::desktop::Window,
@@ -309,19 +386,48 @@ pub fn init_winit(
                                                 >(
                                                     renderer,
                                                     &window,
-                                                    location,
+                                                    target.loc,
                                                     1.0,
                                                     scale,
-                                                    cell,
+                                                    target,
                                                     smithay::desktop::space::ConstrainBehavior {
                                                         reference: smithay::desktop::space::ConstrainReference::BoundingBox,
                                                         behavior: ConstrainScaleBehavior::Fit,
                                                         align: ConstrainAlign::CENTER,
                                                     },
-                                                ),
-                                            );
+                                                )
+                                                .collect();
+
+                                            preview_render_elements += preview_elements.len();
+                                            custom_elements.extend(preview_elements);
                                         }
                                     }
+                                    static OVERVIEW_DIAG_REPORTED: std::sync::atomic::AtomicBool =
+                                        std::sync::atomic::AtomicBool::new(false);
+                                    if !OVERVIEW_DIAG_REPORTED.swap(
+                                        true,
+                                        std::sync::atomic::Ordering::Relaxed,
+                                    ) {
+                                        eprintln!(
+                                            "[VANTA-OVERVIEW-DIAG] workspace={} windows={} preview_render_elements={}",
+                                            workspace,
+                                            discovered_windows,
+                                            preview_render_elements,
+                                        );
+                                    }
+
+                                    if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                                        renderer,
+                                        rect.loc.to_physical_precise_round(scale),
+                                        buffer,
+                                        None,
+                                        Some(Rectangle::from_size((256.0, 160.0).into())),
+                                        Some(rect.size),
+                                        Kind::Unspecified,
+                                    ) {
+                                        custom_elements.push(element.into());
+                                    }
+
                                 }
 
                                 let new_card = layout.new_workspace;
@@ -423,8 +529,10 @@ pub fn init_winit(
                         let mut space_elements =
                             Vec::<OverviewRenderElements>::with_capacity(32);
 
-                        // Top and overlay surfaces are in front of application windows.
-                        for (layer, geometry) in front_layers {
+                        // Layer-shell surfaces are temporarily suppressed in Overview
+                        // to isolate the source of the large L-shaped render regions.
+                        if !state.overview_open {
+                            for (layer, geometry) in front_layers {
                             let location = (geometry.loc - output_geometry.loc)
                                 .to_physical_precise_round(scale);
 
@@ -438,28 +546,32 @@ pub fn init_winit(
                             );
 
                             space_elements.extend(rendered.into_iter().map(|element| {
+                                OverviewRenderElements::Space(
+                                    smithay::desktop::space::SpaceRenderElements::Surface(element),
+                                )
+                            }));
+                            }
+                        }
+
+                        // Overview thumbnails replace full-size application windows.
+                        if !state.overview_open {
+                            let window_elements = state.space.render_elements_for_region(
+                                renderer,
+                                &output_geometry,
+                                scale,
+                                alpha,
+                            );
+
+                            space_elements.extend(window_elements.into_iter().map(|element| {
                                 OverviewRenderElements::Space(
                                     smithay::desktop::space::SpaceRenderElements::Surface(element),
                                 )
                             }));
                         }
 
-                        // Ordinary windows retain Smithay's existing output-region rendering.
-                        let window_elements = state.space.render_elements_for_region(
-                            renderer,
-                            &output_geometry,
-                            scale,
-                            alpha,
-                        );
-
-                        space_elements.extend(window_elements.into_iter().map(|element| {
-                            OverviewRenderElements::Space(
-                                smithay::desktop::space::SpaceRenderElements::Surface(element),
-                            )
-                        }));
-
-                        // Bottom and background surfaces remain behind application windows.
-                        for (layer, geometry) in back_layers {
+                        // Bottom and background surfaces are also suppressed in Overview.
+                        if !state.overview_open {
+                            for (layer, geometry) in back_layers {
                             let location = (geometry.loc - output_geometry.loc)
                                 .to_physical_precise_round(scale);
 
@@ -477,6 +589,23 @@ pub fn init_winit(
                                     smithay::desktop::space::SpaceRenderElements::Surface(element),
                                 )
                             }));
+                            }
+                        }
+
+                        // The corner hint belongs to the desktop background layer:
+                        // above wallpaper, but below panels, windows and Overview UI.
+                        if state.hot_corner_hint_visible {
+                            if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
+                                renderer,
+                                output_geometry.loc.to_physical_precise_round(scale),
+                                &state.hot_corner_buffer,
+                                None,
+                                Some(Rectangle::from_size((24.0, 24.0).into())),
+                                Some((24, 24).into()),
+                                Kind::Unspecified,
+                            ) {
+                                space_elements.push(element.into());
+                            }
                         }
 
                         elements.extend(space_elements);
@@ -504,14 +633,27 @@ pub fn init_winit(
                     }
                     backend.submit(Some(&[damage])).unwrap();
 
-                    state.space.elements().for_each(|window| {
-                        window.send_frame(
-                            &output,
-                            state.start_time.elapsed(),
-                            Some(Duration::ZERO),
-                            |_, _| Some(output.clone()),
-                        )
-                    });
+                    if state.overview_open {
+                        for (id, window) in &state.windows {
+                            if !state.minimized_windows.contains_key(id) && window.alive() {
+                                window.send_frame(
+                                    &output,
+                                    state.start_time.elapsed(),
+                                    Some(Duration::ZERO),
+                                    |_, _| Some(output.clone()),
+                                );
+                            }
+                        }
+                    } else {
+                        state.space.elements().for_each(|window| {
+                            window.send_frame(
+                                &output,
+                                state.start_time.elapsed(),
+                                Some(Duration::ZERO),
+                                |_, _| Some(output.clone()),
+                            )
+                        });
+                    }
 
                     state.space.refresh();
                     state.popups.cleanup();

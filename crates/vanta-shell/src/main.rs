@@ -3,7 +3,7 @@
 mod ipc;
 mod render;
 
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, time::{Duration, Instant}};
 
 use smithay_client_toolkit::reexports::{
     calloop::{channel, EventLoop},
@@ -39,6 +39,8 @@ const BAR_H: u32 = render::theme::PANEL_HEIGHT;
 const DOCK_SURFACE_WIDTH: u32 = render::dock::SURFACE_WIDTH;
 const DOCK_SURFACE_HEIGHT: u32 = render::theme::DOCK_HEIGHT + 16;
 const INITIAL_WIDTH: u32 = 1280;
+const QUICK_SETTINGS_WIDTH: u32 = 360;
+const QUICK_SETTINGS_HEIGHT: u32 = 440;
 
 fn main() {
     let conn = Connection::connect_to_env().expect("WAYLAND_DISPLAY is not set");
@@ -103,12 +105,19 @@ fn main() {
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         pointer: None,
+        compositor: compositor.clone(),
+        layer_shell,
         shm,
         font_renderer,
         panel_pool,
         dock_pool,
         panel_layer: Some(panel_layer),
         dock_layer: Some(dock_layer),
+        quick_settings_layer: None,
+        quick_settings_pool: None,
+        quick_settings_width: QUICK_SETTINGS_WIDTH,
+        quick_settings_height: QUICK_SETTINGS_HEIGHT,
+        quick_settings_first_configure: true,
         panel_width: INITIAL_WIDTH,
         panel_height: BAR_H,
         dock_width: DOCK_SURFACE_WIDTH,
@@ -129,10 +138,19 @@ fn main() {
         eprintln!("vanta-shell: cannot request workspace state: {error}");
     }
 
+    let mut last_workspace_sync = Instant::now();
+
     while !shell.exit {
         event_loop
             .dispatch(Duration::from_millis(16), &mut shell)
             .unwrap();
+
+        if last_workspace_sync.elapsed() >= Duration::from_millis(500) {
+            if let Err(error) = shell.ipc_client.request(Action::ListWorkspaces) {
+                eprintln!("vanta-shell: workspace sync request failed: {error}");
+            }
+            last_workspace_sync = Instant::now();
+        }
     }
 }
 
@@ -141,6 +159,8 @@ struct VantaShell {
     seat_state: SeatState,
     output_state: OutputState,
     pointer: Option<wl_pointer::WlPointer>,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
     shm: Shm,
     font_renderer: render::font::FontRenderer,
 
@@ -149,6 +169,11 @@ struct VantaShell {
 
     panel_layer: Option<LayerSurface>,
     dock_layer: Option<LayerSurface>,
+    quick_settings_layer: Option<LayerSurface>,
+    quick_settings_pool: Option<SlotPool>,
+    quick_settings_width: u32,
+    quick_settings_height: u32,
+    quick_settings_first_configure: bool,
 
     panel_width: u32,
     panel_height: u32,
@@ -179,8 +204,18 @@ impl VantaShell {
                         self.workspace_count = count;
                         self.active_workspace = active_index;
 
-                        if changed && !self.dock_first_configure {
-                            self.draw_dock();
+                        if changed {
+                            if !self.panel_first_configure {
+                                self.draw_panel();
+                            }
+
+                            if !self.dock_first_configure {
+                                self.draw_dock();
+                            }
+
+                            if self.quick_settings_layer.is_some() {
+                                self.draw_quick_settings();
+                            }
                         }
                     }
                 }
@@ -270,6 +305,85 @@ impl VantaShell {
         buffer.attach_to(surface).unwrap();
         layer.commit();
     }
+
+    fn open_quick_settings(&mut self, qh: &QueueHandle<Self>) {
+        if self.quick_settings_layer.is_some() {
+            return;
+        }
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("vanta-quick-settings"),
+            None,
+        );
+
+        layer.set_anchor(Anchor::TOP | Anchor::RIGHT);
+        layer.set_margin(BAR_H as i32 + 8, 12, 0, 0);
+        layer.set_exclusive_zone(0);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.set_size(self.quick_settings_width, self.quick_settings_height);
+        layer.commit();
+
+        let pool_size =
+            self.quick_settings_width as usize * self.quick_settings_height as usize * 4;
+
+        self.quick_settings_pool =
+            Some(SlotPool::new(pool_size, &self.shm).expect("quick settings shm pool"));
+        self.quick_settings_first_configure = true;
+        self.quick_settings_layer = Some(layer);
+    }
+
+    fn close_quick_settings(&mut self) {
+        self.quick_settings_layer = None;
+        self.quick_settings_pool = None;
+        self.quick_settings_first_configure = true;
+    }
+
+    fn draw_quick_settings(&mut self) {
+        let Some(layer) = self.quick_settings_layer.as_ref() else {
+            return;
+        };
+        let Some(pool) = self.quick_settings_pool.as_mut() else {
+            return;
+        };
+
+        let width = self.quick_settings_width;
+        let height = self.quick_settings_height;
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let stride = width as i32 * 4;
+        let (buffer, canvas) = pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
+            .expect("quick settings shm buffer");
+
+        {
+            let mut frame = render::primitives::Canvas::new(canvas, width, height);
+            frame.clear(0x00000000);
+            render::quick_settings::draw(
+                &mut frame,
+                &self.font_renderer,
+                width,
+                height,
+                self.workspace_count,
+                self.active_workspace,
+            );
+        }
+
+        let surface = layer.wl_surface();
+        surface.damage_buffer(0, 0, width as i32, height as i32);
+        buffer.attach_to(surface).unwrap();
+        layer.commit();
+    }
 }
 
 impl CompositorHandler for VantaShell {
@@ -310,6 +424,12 @@ impl CompositorHandler for VantaShell {
             .is_some_and(|layer| surface == layer.wl_surface())
         {
             self.draw_dock();
+        } else if self
+            .quick_settings_layer
+            .as_ref()
+            .is_some_and(|layer| surface == layer.wl_surface())
+        {
+            self.draw_quick_settings();
         }
     }
 
@@ -387,18 +507,15 @@ impl PointerHandler for VantaShell {
     fn pointer_frame(
         &mut self,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
         for event in events {
-            let Some(layer) = self.dock_layer.as_ref() else {
-                continue;
-            };
-
-            if &event.surface != layer.wl_surface() {
-                continue;
-            }
+            eprintln!(
+                "VANTA_POINTER surface={:?} position=({:.1},{:.1}) kind={:?}",
+                event.surface, event.position.0, event.position.1, event.kind
+            );
 
             let PointerEventKind::Release {
                 button: BTN_LEFT, ..
@@ -408,8 +525,69 @@ impl PointerHandler for VantaShell {
             };
 
             let (x, y) = event.position;
-            let strip_top = self.dock_height.saturating_sub(8) as f64;
 
+            // Quick Settings controls.
+            if self
+                .quick_settings_layer
+                .as_ref()
+                .is_some_and(|layer| &event.surface == layer.wl_surface())
+            {
+                match render::quick_settings::hit_test(
+                    self.quick_settings_width,
+                    self.quick_settings_height,
+                    x,
+                    y,
+                    self.workspace_count,
+                ) {
+                    Some(render::quick_settings::ControlAction::Close) => {
+                        self.close_quick_settings();
+                    }
+                    Some(render::quick_settings::ControlAction::SwitchWorkspace(index)) => {
+                        if index != self.active_workspace {
+                            if let Err(error) =
+                                self.ipc_client.request(Action::SwitchWorkspace { index })
+                            {
+                                eprintln!("vanta-shell: workspace switch request failed: {error}");
+                            }
+                        }
+                    }
+                    Some(render::quick_settings::ControlAction::CreateWorkspace) => {
+                        if let Err(error) = self.ipc_client.request(Action::CreateWorkspace) {
+                            eprintln!("vanta-shell: workspace creation request failed: {error}");
+                        }
+                    }
+                    None => {}
+                }
+                continue;
+            }
+
+            // Panel Controls button.
+            if self
+                .panel_layer
+                .as_ref()
+                .is_some_and(|layer| &event.surface == layer.wl_surface())
+            {
+                if render::panel::quick_settings_hit_test(self.panel_width, self.panel_height, x, y)
+                {
+                    if self.quick_settings_layer.is_some() {
+                        self.close_quick_settings();
+                    } else {
+                        self.open_quick_settings(qh);
+                    }
+                }
+                continue;
+            }
+
+            // Existing dock workspace switching.
+            let Some(layer) = self.dock_layer.as_ref() else {
+                continue;
+            };
+
+            if &event.surface != layer.wl_surface() {
+                continue;
+            }
+
+            let strip_top = self.dock_height.saturating_sub(8) as f64;
             if y < strip_top || y >= self.dock_height as f64 {
                 continue;
             }
@@ -431,7 +609,6 @@ impl PointerHandler for VantaShell {
             }
 
             let index = (relative_x / DOT_CELL_WIDTH) as u32;
-
             if index >= count || index == self.active_workspace {
                 continue;
             }
@@ -459,6 +636,13 @@ impl LayerShellHandler for VantaShell {
         {
             self.dock_layer = None;
             eprintln!("vanta-shell: dock surface closed");
+        } else if self
+            .quick_settings_layer
+            .as_ref()
+            .is_some_and(|current| current == layer)
+        {
+            self.close_quick_settings();
+            eprintln!("vanta-shell: quick settings surface closed");
         }
     }
 
@@ -527,6 +711,34 @@ impl LayerShellHandler for VantaShell {
             if should_draw {
                 self.dock_first_configure = false;
                 self.draw_dock();
+            }
+        } else if self
+            .quick_settings_layer
+            .as_ref()
+            .is_some_and(|current| current == layer)
+        {
+            let old_size = (self.quick_settings_width, self.quick_settings_height);
+
+            if let Some(width) = NonZeroU32::new(suggested_width) {
+                self.quick_settings_width = width.get();
+            }
+            if let Some(height) = NonZeroU32::new(suggested_height) {
+                self.quick_settings_height = height.get();
+            }
+
+            let size_changed = old_size != (self.quick_settings_width, self.quick_settings_height);
+
+            if size_changed {
+                let pool_size =
+                    self.quick_settings_width as usize * self.quick_settings_height as usize * 4;
+                self.quick_settings_pool = Some(
+                    SlotPool::new(pool_size, &self.shm).expect("resized quick settings shm pool"),
+                );
+            }
+
+            if self.quick_settings_first_configure || size_changed {
+                self.quick_settings_first_configure = false;
+                self.draw_quick_settings();
             }
         }
     }

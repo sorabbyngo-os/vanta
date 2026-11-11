@@ -102,12 +102,13 @@ pub fn draw(
         12.0,
     );
 
-    // Keep workspace state visible without inventing system-status values.
+    // Shared geometry keeps the workspace pill clear of Quick Settings.
+    let (quick_x, quick_y, quick_width, quick_height) = quick_settings_bounds(width, height);
+
     let label = format!("WORKSPACE  {} / {}", active + 1, count);
     let label_width = font.text_width(&label, 10.5);
-    let right_padding = 18.0;
     let pill_width = label_width + 24.0;
-    let pill_x = (w - right_padding - pill_width).max(nav_x + 150.0);
+    let pill_x = (quick_x - 10.0 - pill_width).max(nav_x + 150.0);
 
     if pill_x + pill_width <= w - 8.0 {
         canvas.rounded_rect_f(
@@ -137,4 +138,50 @@ pub fn draw(
             10.5,
         );
     }
+
+    // Dedicated Quick Settings entry.
+    canvas.rounded_rect_f(
+        quick_x,
+        quick_y,
+        quick_width,
+        quick_height,
+        10.0,
+        theme::COLOR_GLASS_SURFACE,
+    );
+    canvas.rounded_rect_f(
+        quick_x + 0.5,
+        quick_y + 0.5,
+        quick_width - 1.0,
+        1.0,
+        0.5,
+        theme::COLOR_GLASS_HIGHLIGHT,
+    );
+    font.draw_text(
+        canvas,
+        quick_x + 17.0,
+        quick_y + 19.0,
+        "Controls",
+        theme::COLOR_TEXT,
+        12.0,
+    );
+}
+
+/// Panel-local geometry shared by rendering and pointer hit-testing.
+pub fn quick_settings_bounds(width: u32, height: u32) -> (f32, f32, f32, f32) {
+    let x = (width as f32 - 112.0).max(8.0);
+    let y = ((height as f32 - 30.0) * 0.5).max(0.0);
+    (
+        x,
+        y,
+        100.0_f32.min((width as f32 - x).max(0.0)),
+        30.0_f32.min(height as f32),
+    )
+}
+
+pub fn quick_settings_hit_test(width: u32, height: u32, x: f64, y: f64) -> bool {
+    let (left, top, button_width, button_height) = quick_settings_bounds(width, height);
+    x >= left as f64
+        && x < (left + button_width) as f64
+        && y >= top as f64
+        && y < (top + button_height) as f64
 }

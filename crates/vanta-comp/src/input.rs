@@ -1,18 +1,53 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent,
+        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent, TouchCancelEvent,
+        TouchDownEvent, TouchEvent, TouchMotionEvent, TouchUpEvent,
     },
     input::{
         keyboard::{keysyms, FilterResult},
         pointer::{AxisFrame, ButtonEvent, MotionEvent},
     },
-    utils::SERIAL_COUNTER,
+    utils::{Logical, Point, SERIAL_COUNTER},
 };
 
-use crate::state::Vanta;
+use crate::state::{TouchGesture, Vanta};
 
 impl Vanta {
+    fn select_overview_at(&mut self, location: Point<f64, Logical>) {
+        let mut selected_workspace = None;
+        let mut create_workspace = false;
+
+        if let Some(layout) = self.overview_layout() {
+            if let Some((index, _)) = layout.thumbnails.iter().find(|(_, rect)| {
+                location.x >= rect.loc.x as f64
+                    && location.y >= rect.loc.y as f64
+                    && location.x < (rect.loc.x + rect.size.w) as f64
+                    && location.y < (rect.loc.y + rect.size.h) as f64
+            }) {
+                selected_workspace = Some(*index);
+            } else {
+                let rect = layout.new_workspace;
+                create_workspace = location.x >= rect.loc.x as f64
+                    && location.y >= rect.loc.y as f64
+                    && location.x < (rect.loc.x + rect.size.w) as f64
+                    && location.y < (rect.loc.y + rect.size.h) as f64;
+            }
+        }
+
+        if let Some(index) = selected_workspace {
+            if self.switch_workspace(index).is_ok() {
+                self.overview_open = false;
+            }
+        } else if create_workspace {
+            if self.create_workspace().is_ok() {
+                self.overview_open = false;
+            }
+        } else {
+            self.overview_open = false;
+        }
+    }
+
     pub fn process_input_event<I: InputBackend>(&mut self, event: InputEvent<I>) {
         match event {
             InputEvent::Keyboard { event, .. } => {
@@ -62,19 +97,35 @@ impl Vanta {
                 };
 
                 let serial = SERIAL_COUNTER.next_serial();
-                let in_hot_corner = pos.x <= output_geo.loc.x as f64 + 8.0
-                    && pos.y <= output_geo.loc.y as f64 + 8.0;
+                let local_x = pos.x - output_geo.loc.x as f64;
+                let local_y = pos.y - output_geo.loc.y as f64;
+                let previous = self.last_pointer_position;
+                let moving_toward_corner = previous
+                    .map(|old| pos.x < old.x && pos.y < old.y)
+                    .unwrap_or(false);
+
+                let in_hint_zone =
+                    (0.0..=88.0).contains(&local_x) && (0.0..=88.0).contains(&local_y);
+                let in_hot_corner = local_x >= 0.0 && local_y >= 0.0 && local_x + local_y <= 24.0;
+
+                if !in_hint_zone {
+                    self.hot_corner_hint_visible = false;
+                } else if moving_toward_corner {
+                    self.hot_corner_hint_visible = true;
+                }
 
                 if !in_hot_corner {
                     self.hot_corner_armed = true;
-                } else if self.hot_corner_armed && !pointer.is_grabbed() {
+                } else if self.hot_corner_armed && moving_toward_corner && !pointer.is_grabbed() {
                     self.hot_corner_armed = false;
+                    self.overview_open = !self.overview_open;
 
-                    if !self.overview_open {
-                        self.overview_open = true;
+                    if self.overview_open {
                         let _ = self.clear_focus_with_serial(serial);
                     }
                 }
+
+                self.last_pointer_position = Some(pos);
 
                 if self.overview_open {
                     pointer.motion(
@@ -114,34 +165,7 @@ impl Vanta {
                         && event.button() == Some(MouseButton::Left)
                         && !pointer.is_grabbed()
                     {
-                        let location = pointer.current_location();
-                        let mut selected_workspace = None;
-                        let mut create_workspace = false;
-
-                        if let Some(layout) = self.overview_layout() {
-                            if let Some((index, _)) = layout.thumbnails.iter().find(|(_, rect)| {
-                                location.x >= rect.loc.x as f64
-                                    && location.y >= rect.loc.y as f64
-                                    && location.x < (rect.loc.x + rect.size.w) as f64
-                                    && location.y < (rect.loc.y + rect.size.h) as f64
-                            }) {
-                                selected_workspace = Some(*index);
-                            } else {
-                                let rect = layout.new_workspace;
-                                create_workspace = location.x >= rect.loc.x as f64
-                                    && location.y >= rect.loc.y as f64
-                                    && location.x < (rect.loc.x + rect.size.w) as f64
-                                    && location.y < (rect.loc.y + rect.size.h) as f64;
-                            }
-                        }
-
-                        if let Some(index) = selected_workspace {
-                            let _ = self.switch_workspace(index);
-                        } else if create_workspace {
-                            let _ = self.create_workspace();
-                        } else {
-                            self.overview_open = false;
-                        }
+                        self.select_overview_at(pointer.current_location());
                     }
 
                     return;
@@ -192,6 +216,87 @@ impl Vanta {
                     },
                 );
                 pointer.frame(self);
+            }
+
+            InputEvent::TouchDown { event, .. } => {
+                let Some(output) = self.space.outputs().next() else {
+                    return;
+                };
+                let Some(output_geo) = self.space.output_geometry(output) else {
+                    return;
+                };
+
+                if self.touch_gesture.is_none() {
+                    let position =
+                        event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                    self.touch_gesture = Some(TouchGesture {
+                        slot: i32::from(event.slot()),
+                        start: position,
+                        current: position,
+                    });
+                }
+            }
+
+            InputEvent::TouchMotion { event, .. } => {
+                let slot = i32::from(event.slot());
+                if let Some(gesture) = self.touch_gesture.as_mut() {
+                    if gesture.slot == slot {
+                        let Some(output) = self.space.outputs().next() else {
+                            return;
+                        };
+                        let Some(output_geo) = self.space.output_geometry(output) else {
+                            return;
+                        };
+                        gesture.current =
+                            event.position_transformed(output_geo.size) + output_geo.loc.to_f64();
+                    }
+                }
+            }
+
+            InputEvent::TouchUp { event, .. } => {
+                let slot = i32::from(event.slot());
+                let Some(gesture) = self.touch_gesture.take() else {
+                    return;
+                };
+                if gesture.slot != slot {
+                    self.touch_gesture = Some(gesture);
+                    return;
+                }
+
+                let dx = gesture.current.x - gesture.start.x;
+                let dy = gesture.current.y - gesture.start.y;
+                let moved_sq = dx * dx + dy * dy;
+
+                if self.overview_open && moved_sq <= 144.0 {
+                    self.select_overview_at(gesture.current);
+                } else {
+                    let Some(output) = self.space.outputs().next() else {
+                        return;
+                    };
+                    let Some(output_geo) = self.space.output_geometry(output) else {
+                        return;
+                    };
+                    let start_x = gesture.start.x - output_geo.loc.x as f64;
+                    let start_y = gesture.start.y - output_geo.loc.y as f64;
+                    let from_top_left_edge =
+                        start_x >= 0.0 && start_y >= 0.0 && start_x + start_y <= 64.0;
+                    let inward_swipe = dx >= 56.0 && dy >= 56.0;
+
+                    if from_top_left_edge && inward_swipe {
+                        self.overview_open = !self.overview_open;
+                        if self.overview_open {
+                            let serial = SERIAL_COUNTER.next_serial();
+                            let _ = self.clear_focus_with_serial(serial);
+                        }
+                    }
+                }
+            }
+
+            InputEvent::TouchCancel { event, .. } => {
+                let slot = i32::from(event.slot());
+                if self.touch_gesture.as_ref().map(|gesture| gesture.slot) == Some(slot) {
+                    self.touch_gesture = None;
+                }
             }
 
             InputEvent::PointerAxis { event, .. } => {

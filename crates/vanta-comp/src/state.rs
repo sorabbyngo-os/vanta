@@ -79,8 +79,14 @@ pub(crate) fn create_overview_glass_buffer() -> MemoryRenderBuffer {
                 let top_glow = (1.0 - vertical * 3.2).clamp(0.0, 1.0);
                 let edge = if distance > RADIUS - 1.4 { 1.0 } else { 0.0 };
 
+                let coverage = (RADIUS + 0.5 - distance).clamp(0.0, 1.0);
+                if coverage <= 0.0 {
+                    continue;
+                }
+
                 let alpha = (92.0 + 20.0 * (1.0 - vertical) + 22.0 * top_glow + 24.0 * edge)
-                    .clamp(0.0, 160.0);
+                    .clamp(0.0, 160.0)
+                    * coverage;
 
                 let red = 91.0 + 28.0 * top_glow + 35.0 * edge;
                 let green = 126.0 + 34.0 * top_glow + 42.0 * edge;
@@ -103,11 +109,200 @@ pub(crate) fn create_overview_glass_buffer() -> MemoryRenderBuffer {
     buffer
 }
 
+/// Small translucent glass triangle marking the Overview hot corner.
+
+/// Small warm translucent glass surface for the minimize target.
+pub(crate) fn create_minimize_glass_buffer() -> MemoryRenderBuffer {
+    const WIDTH: i32 = 200;
+    const HEIGHT: i32 = 80;
+    const RADIUS: f32 = 16.0;
+
+    let mut buffer = MemoryRenderBuffer::new(
+        Fourcc::Argb8888,
+        (WIDTH, HEIGHT),
+        1,
+        smithay::utils::Transform::Normal,
+        None,
+    );
+
+    let _ = buffer.render().draw(|pixels| {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let px = x as f32 + 0.5;
+                let py = y as f32 + 0.5;
+                let cx = px.clamp(RADIUS, WIDTH as f32 - RADIUS);
+                let cy = py.clamp(RADIUS, HEIGHT as f32 - RADIUS);
+                let dx = px - cx;
+                let dy = py - cy;
+                let distance = (dx * dx + dy * dy).sqrt();
+
+                if distance > RADIUS + 0.5 {
+                    continue;
+                }
+
+                let coverage = (RADIUS + 0.5 - distance).clamp(0.0, 1.0);
+                let vertical = y as f32 / HEIGHT as f32;
+                let top_glow = (1.0 - vertical * 3.0).clamp(0.0, 1.0);
+                let edge = if distance > RADIUS - 1.4 { 1.0 } else { 0.0 };
+                let alpha = (48.0 + 22.0 * top_glow + 28.0 * edge) * coverage;
+
+                let red = 255.0;
+                let green = 155.0 + 55.0 * top_glow + 25.0 * edge;
+                let blue = 75.0 + 35.0 * top_glow + 35.0 * edge;
+                let a = alpha / 255.0;
+                let offset = ((y * WIDTH + x) * 4) as usize;
+
+                pixels[offset] = (blue * a).round() as u8;
+                pixels[offset + 1] = (green * a).round() as u8;
+                pixels[offset + 2] = (red * a).round() as u8;
+                pixels[offset + 3] = alpha.round() as u8;
+            }
+        }
+
+        Ok::<_, ()>(vec![Rectangle::from_size((WIDTH, HEIGHT).into())])
+    });
+
+    buffer
+}
+
+pub(crate) fn create_hot_corner_buffer() -> MemoryRenderBuffer {
+    const SIZE: i32 = 24;
+
+    let mut buffer = MemoryRenderBuffer::new(
+        Fourcc::Argb8888,
+        (SIZE, SIZE),
+        1,
+        smithay::utils::Transform::Normal,
+        None,
+    );
+
+    let _ = buffer.render().draw(|pixels| {
+        for y in 0..SIZE {
+            for x in 0..SIZE {
+                let distance = SIZE as f32 - (x as f32 + y as f32 + 1.0);
+                let coverage = (distance + 0.5).clamp(0.0, 1.0);
+
+                if coverage <= 0.0 {
+                    continue;
+                }
+
+                let edge = if distance < 1.5 { 1.0 } else { 0.0 };
+                let alpha = (17.0 + edge * 10.0) * coverage;
+                let red = 105.0 + edge * 20.0;
+                let green = 175.0 + edge * 20.0;
+                let blue = 230.0 + edge * 18.0;
+                let a = alpha / 255.0;
+
+                let offset = ((y * SIZE + x) * 4) as usize;
+
+                // ARGB8888 is stored as BGRA bytes on little-endian systems.
+                pixels[offset] = (blue * a).round() as u8;
+                pixels[offset + 1] = (green * a).round() as u8;
+                pixels[offset + 2] = (red * a).round() as u8;
+                pixels[offset + 3] = alpha.round() as u8;
+            }
+        }
+
+        Ok::<_, ()>(vec![Rectangle::from_size((SIZE, SIZE).into())])
+    });
+
+    buffer
+}
+
+/// Fixed-width workspace indicator strip used while Overview is active.
+pub(crate) fn create_overview_indicator_buffer(
+    workspace_count: u32,
+    active_workspace: u32,
+) -> MemoryRenderBuffer {
+    const WIDTH: i32 = 128;
+    const HEIGHT: i32 = 20;
+    const MAX_DIAMETER: f32 = 10.0;
+    const MIN_DIAMETER: f32 = 2.5;
+
+    let count = workspace_count.max(1);
+    let diameter = (12.0 / (count as f32).sqrt()).clamp(MIN_DIAMETER, MAX_DIAMETER);
+    let radius = diameter / 2.0;
+    let first_center = 10.0_f32;
+    let last_center = WIDTH as f32 - 10.0;
+
+    let mut buffer = MemoryRenderBuffer::new(
+        Fourcc::Argb8888,
+        (WIDTH, HEIGHT),
+        1,
+        smithay::utils::Transform::Normal,
+        None,
+    );
+
+    let _ = buffer.render().draw(|pixels| {
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let mut color = None;
+
+                for index in 0..count {
+                    let center_x = if count == 1 {
+                        WIDTH as f32 / 2.0
+                    } else {
+                        first_center
+                            + (last_center - first_center) * index as f32 / (count - 1) as f32
+                    };
+
+                    let dx = x as f32 + 0.5 - center_x;
+                    let dy = y as f32 + 0.5 - HEIGHT as f32 / 2.0;
+                    let distance = (dx * dx + dy * dy).sqrt();
+                    let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+
+                    if coverage <= 0.0 {
+                        continue;
+                    }
+
+                    let active = index == active_workspace.min(count - 1);
+                    let alpha = (if active { 245.0 } else { 115.0 }) * coverage;
+
+                    // Premultiplied BGRA for ARGB8888 on little-endian systems.
+                    let (red, green, blue) = if active {
+                        (132.0, 218.0, 245.0)
+                    } else {
+                        (205.0, 220.0, 238.0)
+                    };
+
+                    let a = alpha / 255.0;
+                    color = Some((
+                        (blue * a).round() as u8,
+                        (green * a).round() as u8,
+                        (red * a).round() as u8,
+                        alpha.round() as u8,
+                    ));
+                    break;
+                }
+
+                if let Some((blue, green, red, alpha)) = color {
+                    let offset = ((y * WIDTH + x) * 4) as usize;
+                    pixels[offset] = blue;
+                    pixels[offset + 1] = green;
+                    pixels[offset + 2] = red;
+                    pixels[offset + 3] = alpha;
+                }
+            }
+        }
+
+        Ok::<_, ()>(vec![Rectangle::from_size((WIDTH, HEIGHT).into())])
+    });
+
+    buffer
+}
+
 /// Shared geometry for the Strip overview, used by both rendering and input.
 pub(crate) struct OverviewLayout {
     pub thumbnails: Vec<(u32, Rectangle<i32, Logical>)>,
     pub active_preview: Rectangle<i32, Logical>,
     pub new_workspace: Rectangle<i32, Logical>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TouchGesture {
+    pub slot: i32,
+    pub start: Point<f64, Logical>,
+    pub current: Point<f64, Logical>,
 }
 
 pub struct Vanta {
@@ -120,9 +315,11 @@ pub struct Vanta {
     pub(crate) snap_preview: Option<Rectangle<i32, Logical>>,
     pub(crate) snap_preview_buffer: SolidColorBuffer,
     pub(crate) minimize_preview: Option<Rectangle<i32, Logical>>,
-    pub(crate) minimize_preview_buffer: SolidColorBuffer,
+    pub(crate) minimize_preview_buffer: MemoryRenderBuffer,
     pub(crate) overview_card_buffers: Vec<MemoryRenderBuffer>,
     pub(crate) overview_active_buffer: MemoryRenderBuffer,
+    pub(crate) overview_indicator_buffer: MemoryRenderBuffer,
+    pub(crate) hot_corner_buffer: MemoryRenderBuffer,
     pub(crate) overview_new_buffer: MemoryRenderBuffer,
     pub(crate) overview_plus_buffer: SolidColorBuffer,
     pub(crate) overview_plus_vertical_buffer: SolidColorBuffer,
@@ -133,6 +330,9 @@ pub struct Vanta {
     pub(crate) active_workspace: u32,
     pub(crate) overview_open: bool,
     pub(crate) hot_corner_armed: bool,
+    pub(crate) hot_corner_hint_visible: bool,
+    pub(crate) last_pointer_position: Option<Point<f64, Logical>>,
+    pub(crate) touch_gesture: Option<TouchGesture>,
     pub(crate) window_workspaces: HashMap<u64, u32>,
     pub(crate) window_locations: HashMap<u64, Point<i32, Logical>>,
     /// Vanta-assigned stable IDs mapped to Smithay window handles.
@@ -198,19 +398,28 @@ impl Vanta {
         let snap_preview = None;
         let snap_preview_buffer = SolidColorBuffer::new((0, 0), [0.20, 0.48, 0.95, 0.24]);
         let minimize_preview = None;
-        let minimize_preview_buffer = SolidColorBuffer::new((0, 0), [0.95, 0.62, 0.16, 0.32]);
+        let minimize_preview_buffer = create_minimize_glass_buffer();
+        let workspace_count = 1;
+        let active_workspace = 0;
         let overview_card_buffers = Vec::new();
         let overview_active_buffer = create_overview_glass_buffer();
+        let overview_indicator_buffer =
+            create_overview_indicator_buffer(workspace_count, active_workspace);
+        let hot_corner_buffer = create_hot_corner_buffer();
         let overview_new_buffer = create_overview_glass_buffer();
         let overview_plus_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
         let overview_plus_vertical_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
         let floating_windows = HashSet::new();
         let layout_sizes = HashMap::new();
         let minimized_windows = HashMap::new();
-        let workspace_count = 1;
-        let active_workspace = 0;
         let overview_open = false;
         let hot_corner_armed = false;
+        let hot_corner_hint_visible = false;
+        let last_pointer_position: Option<Point<f64, Logical>> = None;
+        let touch_gesture: Option<TouchGesture> = None;
+        let hot_corner_hint_visible = false;
+        let last_pointer_position: Option<Point<f64, Logical>> = None;
+        let touch_gesture: Option<TouchGesture> = None;
         let window_workspaces = HashMap::new();
         let window_locations = HashMap::new();
         let windows = HashMap::new();
@@ -234,6 +443,8 @@ impl Vanta {
             minimize_preview_buffer,
             overview_card_buffers,
             overview_active_buffer,
+            overview_indicator_buffer,
+            hot_corner_buffer,
             overview_new_buffer,
             overview_plus_buffer,
             overview_plus_vertical_buffer,
@@ -244,6 +455,9 @@ impl Vanta {
             active_workspace,
             overview_open,
             hot_corner_armed,
+            hot_corner_hint_visible,
+            last_pointer_position,
+            touch_gesture,
             window_workspaces,
             window_locations,
             windows,
@@ -433,6 +647,8 @@ impl Vanta {
 
         self.layout_sizes.clear();
         self.relayout_windows();
+        self.overview_indicator_buffer =
+            create_overview_indicator_buffer(self.workspace_count, self.active_workspace);
         Ok(())
     }
 

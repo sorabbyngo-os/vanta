@@ -57,10 +57,14 @@ impl CompositorHandler for Vanta {
             while let Some(parent) = get_parent(&root) {
                 root = parent;
             }
+            // Resolve against the persistent window registry, not Space:
+            // inactive workspace windows are unmapped from Space but must
+            // continue processing commits for live overview previews.
             if let Some(window) = self
-                .space
-                .elements()
+                .windows
+                .values()
                 .find(|w| w.toplevel().unwrap().wl_surface() == &root)
+                .cloned()
             {
                 window.on_commit();
             }

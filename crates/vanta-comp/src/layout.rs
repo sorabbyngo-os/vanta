@@ -16,66 +16,62 @@ pub enum SnapTarget {
     Maximize,
 }
 
-/// Calculate a snap rectangle from the dragged window bounds and output geometry.
+/// Calculate a snap rectangle from the pointer position and output geometry.
 ///
-/// The top edge takes priority over the left and right edges.
+/// The top edge takes priority over the left and right edges. Pointer
+/// coordinates are global logical coordinates, independent of window size.
 pub fn calculate_snap_target(
-    window_bounds: Rectangle<i32, Logical>,
+    pointer: Point<f64, Logical>,
     output: Rectangle<i32, Logical>,
     threshold: i32,
 ) -> Option<(SnapTarget, Rectangle<i32, Logical>)> {
     let threshold = threshold.max(1);
     let side_threshold = threshold.saturating_mul(3);
 
-    let output_right = output.loc.x.saturating_add(output.size.w);
-    let output_bottom = output.loc.y.saturating_add(output.size.h);
-    let window_right = window_bounds.loc.x.saturating_add(window_bounds.size.w);
-    let window_bottom = window_bounds.loc.y.saturating_add(window_bounds.size.h);
+    let output_left = output.loc.x as f64;
+    let output_top = output.loc.y as f64;
+    let output_right = output.loc.x.saturating_add(output.size.w) as f64;
+    let output_bottom = output.loc.y.saturating_add(output.size.h) as f64;
 
-    let overlaps_horizontally = window_bounds.loc.x < output_right && window_right > output.loc.x;
-    let overlaps_vertically = window_bounds.loc.y < output_bottom && window_bottom > output.loc.y;
+    let inside_horizontal = pointer.x >= output_left && pointer.x < output_right;
+    let inside_vertical = pointer.y >= output_top && pointer.y < output_bottom;
 
-    if overlaps_horizontally && window_bounds.loc.y <= output.loc.y.saturating_add(threshold) {
+    if inside_horizontal && pointer.y <= output_top + threshold as f64 {
         return Some((SnapTarget::Maximize, output));
     }
 
-    let gap = if output.size.w >= 48 && output.size.h >= 48 {
-        12
-    } else {
-        0
-    };
-
-    let left_edge = output.loc.x.saturating_add(side_threshold);
-    let right_edge = output_right.saturating_sub(side_threshold);
+    let gap = if output.size.w >= 48 && output.size.h >= 48 { 12 } else { 0 };
 
     let inner_x = output.loc.x.saturating_add(gap);
     let inner_y = output.loc.y.saturating_add(gap);
     let inner_width = output.size.w.saturating_sub(gap.saturating_mul(2)).max(1);
     let inner_height = output.size.h.saturating_sub(gap.saturating_mul(2)).max(1);
-
     let half_width = inner_width.saturating_sub(gap).max(1) / 2;
 
-    if overlaps_vertically && window_bounds.loc.x <= left_edge {
-        let rect = Rectangle::new(
-            (inner_x, inner_y).into(),
-            (half_width.max(1), inner_height).into(),
-        );
-        return Some((SnapTarget::Left, rect));
+    if inside_vertical && pointer.x <= output_left + side_threshold as f64 {
+        return Some((
+            SnapTarget::Left,
+            Rectangle::new(
+                (inner_x, inner_y).into(),
+                (half_width.max(1), inner_height).into(),
+            ),
+        ));
     }
 
-    if overlaps_vertically && window_right >= right_edge {
+    if inside_vertical && pointer.x >= output_right - side_threshold as f64 {
         let right_x = inner_x.saturating_add(half_width).saturating_add(gap);
         let right_width = inner_width
             .saturating_sub(half_width)
             .saturating_sub(gap)
             .max(1);
 
-        let rect = Rectangle::new(
-            (right_x, inner_y).into(),
-            (right_width, inner_height).into(),
-        );
-
-        return Some((SnapTarget::Right, rect));
+        return Some((
+            SnapTarget::Right,
+            Rectangle::new(
+                (right_x, inner_y).into(),
+                (right_width, inner_height).into(),
+            ),
+        ));
     }
 
     None
@@ -273,62 +269,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn left_edge_produces_left_half_snap() {
+    fn pointer_at_left_edge_produces_left_half_snap() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let (target, rect) =
+            calculate_snap_target((60.0, 500.0).into(), output, 24).unwrap();
 
-        let result = calculate_snap_target(
-            Rectangle::new((60, 300).into(), (600, 400).into()),
-            output,
-            24,
-        );
-
-        let (target, rect) = result.unwrap();
         assert_eq!(target, SnapTarget::Left);
         assert_eq!(rect.loc, (12, 12).into());
         assert_eq!(rect.size, (942, 1056).into());
     }
 
     #[test]
-    fn right_edge_produces_right_half_snap() {
+    fn pointer_at_right_edge_produces_right_half_snap() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let (target, rect) =
+            calculate_snap_target((1860.0, 500.0).into(), output, 24).unwrap();
 
-        let result = calculate_snap_target(
-            Rectangle::new((1260, 300).into(), (600, 400).into()),
-            output,
-            24,
-        );
-
-        let (target, rect) = result.unwrap();
         assert_eq!(target, SnapTarget::Right);
         assert_eq!(rect.loc, (966, 12).into());
         assert_eq!(rect.size, (942, 1056).into());
     }
 
     #[test]
-    fn top_edge_produces_maximize_target() {
+    fn pointer_at_top_edge_produces_maximize_target() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let (target, rect) =
+            calculate_snap_target((960.0, 20.0).into(), output, 24).unwrap();
 
-        let result = calculate_snap_target(
-            Rectangle::new((600, 20).into(), (600, 400).into()),
-            output,
-            24,
-        );
-
-        let (target, rect) = result.unwrap();
         assert_eq!(target, SnapTarget::Maximize);
         assert_eq!(rect, output);
     }
 
     #[test]
-    fn window_away_from_snap_edges_has_no_target() {
+    fn pointer_at_top_left_prefers_maximize() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        let (target, _) =
+            calculate_snap_target((10.0, 10.0).into(), output, 24).unwrap();
 
-        assert!(calculate_snap_target(
-            Rectangle::new((600, 300).into(), (600, 400).into()),
-            output,
-            24
-        )
-        .is_none());
+        assert_eq!(target, SnapTarget::Maximize);
+    }
+
+    #[test]
+    fn pointer_away_from_snap_edges_has_no_target() {
+        let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
+        assert!(calculate_snap_target((960.0, 500.0).into(), output, 24).is_none());
     }
 
     #[test]

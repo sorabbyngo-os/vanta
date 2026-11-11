@@ -47,32 +47,48 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
 
         let delta = event.location - self.start_data.location;
         let new_location = self.initial_window_location.to_f64() + delta;
+        let new_location = new_location.to_i32_round();
         data.space
-            .map_element(self.window.clone(), new_location.to_i32_round(), true);
+            .map_element(self.window.clone(), new_location, true);
+
+        if let Some(id) = data
+            .windows
+            .iter()
+            .find_map(|(id, window)| (window == &self.window).then_some(*id))
+        {
+            data.window_locations.insert(id, new_location);
+        }
 
         // Minimize activates when the dragged window's bottom edge enters
         // the bottom zone while the window is being moved downward.
+
+
         let minimize_preview = if delta.y > 0.0 {
             data.output
                 .as_ref()
                 .and_then(|output| data.space.output_geometry(output))
                 .and_then(|output_geometry| {
-                    data.space
-                        .element_bbox(&self.window)
-                        .and_then(|window_bounds| {
-                            let window_bottom = window_bounds.loc.y + window_bounds.size.h;
-                            let output_bottom = output_geometry.loc.y + output_geometry.size.h;
+                    let output_bottom =
+                        output_geometry.loc.y + output_geometry.size.h;
 
-                            (window_bottom >= output_bottom - MINIMIZE_THRESHOLD).then(|| {
-                                Rectangle::new(
-                                    (
-                                        output_bottom - MINIMIZE_PREVIEW_SIZE.0 - 16,
-                                        output_bottom - MINIMIZE_PREVIEW_SIZE.1 - 16,
-                                    )
-                                        .into(),
-                                    MINIMIZE_PREVIEW_SIZE.into(),
+                    (event.location.y
+                        >= (output_bottom - MINIMIZE_THRESHOLD) as f64)
+                        .then(|| {
+                            let preview_x = output_geometry.loc.x
+                                + (output_geometry.size.w
+                                    - MINIMIZE_PREVIEW_SIZE.0)
+                                    / 2;
+
+                            Rectangle::new(
+                                (
+                                    preview_x,
+                                    output_bottom
+                                        - MINIMIZE_PREVIEW_SIZE.1
+                                        - 16,
                                 )
-                            })
+                                    .into(),
+                                MINIMIZE_PREVIEW_SIZE.into(),
+                            )
                         })
                 })
         } else {
@@ -90,11 +106,7 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
                 .as_ref()
                 .and_then(|output| data.space.output_geometry(output))
                 .and_then(|output_geometry| {
-                    data.space
-                        .element_bbox(&self.window)
-                        .and_then(|window_bounds| {
-                            calculate_snap_target(window_bounds, output_geometry, SNAP_THRESHOLD)
-                        })
+                    calculate_snap_target(event.location, output_geometry, SNAP_THRESHOLD)
                 })
         };
 
@@ -152,6 +164,14 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
             } else if let Some((target, rect)) = self.snap_target.take() {
                 // Apply the last valid snap target before ending the move grab.
                 data.space.map_element(self.window.clone(), rect.loc, true);
+
+                if let Some(id) = data
+                    .windows
+                    .iter()
+                    .find_map(|(id, window)| (window == &self.window).then_some(*id))
+                {
+                    data.window_locations.insert(id, rect.loc);
+                }
 
                 if let Some(toplevel) = self.window.toplevel().filter(|toplevel| toplevel.alive()) {
                     toplevel.with_pending_state(|state| {
