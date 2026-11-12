@@ -2,10 +2,13 @@
 
 mod handlers;
 
+mod backend;
 mod grabs;
 mod input;
 mod ipc;
 mod layout;
+mod native;
+mod scene;
 mod state;
 mod winit;
 
@@ -14,6 +17,9 @@ pub use state::Vanta;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_logging();
+
+    let backend = backend::BackendKind::from_env_and_args()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 
     let mut event_loop: EventLoop<Vanta> = EventLoop::try_new()?;
 
@@ -24,15 +30,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Start the local control socket before entering the compositor loop.
     let _ipc_server = ipc::start(&mut event_loop)?;
 
-    // Open a Wayland/X11 window for our nested compositor
-    crate::winit::init_winit(&mut event_loop, &mut state)?;
+    // Initialize the selected backend. Keep the native session alive for the
+    // entire compositor lifetime.
+    let _native_session = match backend {
+        backend::BackendKind::Winit => {
+            crate::winit::init_winit(&mut event_loop, &mut state)?;
+            None
+        }
+        backend::BackendKind::Native => {
+            let session = crate::native::init_native(&mut event_loop, &mut state)?;
 
-    // Set WAYLAND_DISPLAY to our socket name, so child processes connect to Vanta rather
-    // than the host compositor
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+            // Connect the shell to Vanta's Wayland socket in native mode too.
+            // Start it once; it can receive output configuration after hotplug.
+            unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+            spawn_shell();
 
-    // Launch the native shell inside this nested Wayland session.
-    spawn_shell();
+            Some(session)
+        }
+    };
+
+    // Winit is a nested development backend. Native mode will launch the shell
+    // only after its DRM output has been initialized.
+    if matches!(backend, backend::BackendKind::Winit) {
+        unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
+        spawn_shell();
+    }
 
     event_loop.run(None, &mut state, move |_| {
         // Vanta is running

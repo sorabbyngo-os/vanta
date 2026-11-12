@@ -17,6 +17,10 @@ rev = "6b37edc019889148608a73e3e27423979cd642c8"
 default-features = false
 features = [
     "backend_winit",
+    "backend_session_libseat",
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
     "wayland_frontend",
     "desktop",
     "renderer_gl",

@@ -1,12 +1,12 @@
 use smithay::{
     backend::input::{
         AbsolutePositionEvent, Axis, AxisSource, ButtonState, Event, InputBackend, InputEvent,
-        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent, TouchCancelEvent,
-        TouchDownEvent, TouchEvent, TouchMotionEvent, TouchUpEvent,
+        KeyboardKeyEvent, MouseButton, PointerAxisEvent, PointerButtonEvent, PointerMotionEvent,
+        TouchCancelEvent, TouchDownEvent, TouchEvent, TouchMotionEvent, TouchUpEvent,
     },
     input::{
         keyboard::{keysyms, FilterResult},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent},
+        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
 };
@@ -79,7 +79,63 @@ impl Vanta {
                 );
             }
 
-            InputEvent::PointerMotion { .. } => {}
+            InputEvent::PointerMotion { event, .. } => {
+                let Some(output) = self.space.outputs().next() else {
+                    return;
+                };
+
+                let Some(output_geo) = self.space.output_geometry(output) else {
+                    return;
+                };
+
+                let Some(pointer) = self.seat.get_pointer() else {
+                    return;
+                };
+
+                let delta = event.delta();
+                let delta_unaccel = event.delta_unaccel();
+                let current = pointer.current_location();
+
+                let max_x = (output_geo.loc.x + output_geo.size.w - 1) as f64;
+                let max_y = (output_geo.loc.y + output_geo.size.h - 1) as f64;
+
+                let pos: Point<f64, Logical> = (
+                    (current.x + delta.x).clamp(output_geo.loc.x as f64, max_x),
+                    (current.y + delta.y).clamp(output_geo.loc.y as f64, max_y),
+                )
+                    .into();
+
+                let serial = SERIAL_COUNTER.next_serial();
+
+                let under = if self.overview_open {
+                    None
+                } else {
+                    self.surface_under(pos)
+                };
+
+                pointer.motion(
+                    self,
+                    under.clone(),
+                    &MotionEvent {
+                        location: pos,
+                        serial,
+                        time: event.time(),
+                    },
+                );
+
+                pointer.relative_motion(
+                    self,
+                    under,
+                    &RelativeMotionEvent {
+                        delta,
+                        delta_unaccel,
+                        time: event.time(),
+                    },
+                );
+
+                self.last_pointer_position = Some(pos);
+                pointer.frame(self);
+            }
 
             InputEvent::PointerMotionAbsolute { event, .. } => {
                 let Some(output) = self.space.outputs().next() else {
@@ -176,9 +232,11 @@ impl Vanta {
                 let button_state = event.state();
 
                 if button_state == ButtonState::Pressed && !pointer.is_grabbed() {
+                    let pointer_location = pointer.current_location();
+
                     if let Some((window, _loc)) = self
                         .space
-                        .element_under(pointer.current_location())
+                        .element_under(pointer_location)
                         .map(|(window, loc)| (window.clone(), loc))
                     {
                         if let Some(id) = self
@@ -188,15 +246,14 @@ impl Vanta {
                         {
                             let _ = self.focus_window_with_serial(id, serial);
                         }
-                    } else {
-                        // Clear stale pointer focus before forwarding the click.
-                        // This prevents an empty-desktop click from being delivered
-                        // to a previously focused client.
+                    } else if self.surface_under(pointer_location).is_none() {
+                        // Clear focus only when no layer-shell or app surface is beneath
+                        // the pointer. Preserve focus for panel and dock clicks.
                         pointer.motion(
                             self,
                             None,
                             &MotionEvent {
-                                location: pointer.current_location(),
+                                location: pointer_location,
                                 serial: SERIAL_COUNTER.next_serial(),
                                 time: event.time(),
                             },

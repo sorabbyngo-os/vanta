@@ -7,6 +7,7 @@ pub fn draw(
     height: u32,
     workspace_count: u32,
     active_workspace: u32,
+    controls_hovered: bool,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -17,8 +18,6 @@ pub fn draw(
     let center_y = h * 0.5;
 
     // Full-width glass surface with a subtle upper reflection.
-    canvas.fill_rect_f(0.0, 0.0, w, 1.0, theme::COLOR_GLASS_HIGHLIGHT);
-    canvas.fill_rect_f(0.0, h - 1.0, w, 1.0, theme::COLOR_GLASS_EDGE);
 
     let control_y = ((h - 30.0) * 0.5).max(0.0);
     let control_h = 30.0_f32.min(h);
@@ -38,14 +37,6 @@ pub fn draw(
         control_h,
         10.0,
         theme::COLOR_GLASS_SURFACE,
-    );
-    canvas.rounded_rect_f(
-        12.5,
-        control_y + 0.5,
-        activities_width - 1.0,
-        1.0,
-        0.5,
-        theme::COLOR_GLASS_HIGHLIGHT,
     );
 
     font.draw_text(
@@ -120,15 +111,6 @@ pub fn draw(
             theme::COLOR_GLASS_SURFACE,
         );
 
-        canvas.rounded_rect_f(
-            pill_x + 0.5,
-            control_y + 0.5,
-            pill_width - 1.0,
-            1.0,
-            0.5,
-            theme::COLOR_GLASS_HIGHLIGHT,
-        );
-
         font.draw_text(
             canvas,
             pill_x + 12.0,
@@ -146,15 +128,11 @@ pub fn draw(
         quick_width,
         quick_height,
         10.0,
-        theme::COLOR_GLASS_SURFACE,
-    );
-    canvas.rounded_rect_f(
-        quick_x + 0.5,
-        quick_y + 0.5,
-        quick_width - 1.0,
-        1.0,
-        0.5,
-        theme::COLOR_GLASS_HIGHLIGHT,
+        if controls_hovered {
+            theme::COLOR_PANEL_ACCENT
+        } else {
+            theme::COLOR_GLASS_SURFACE
+        },
     );
     font.draw_text(
         canvas,

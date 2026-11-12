@@ -40,7 +40,11 @@ pub fn calculate_snap_target(
         return Some((SnapTarget::Maximize, output));
     }
 
-    let gap = if output.size.w >= 48 && output.size.h >= 48 { 12 } else { 0 };
+    let gap = if output.size.w >= 48 && output.size.h >= 48 {
+        12
+    } else {
+        0
+    };
 
     let inner_x = output.loc.x.saturating_add(gap);
     let inner_y = output.loc.y.saturating_add(gap);
@@ -271,8 +275,7 @@ mod tests {
     #[test]
     fn pointer_at_left_edge_produces_left_half_snap() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
-        let (target, rect) =
-            calculate_snap_target((60.0, 500.0).into(), output, 24).unwrap();
+        let (target, rect) = calculate_snap_target((60.0, 500.0).into(), output, 24).unwrap();
 
         assert_eq!(target, SnapTarget::Left);
         assert_eq!(rect.loc, (12, 12).into());
@@ -282,8 +285,7 @@ mod tests {
     #[test]
     fn pointer_at_right_edge_produces_right_half_snap() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
-        let (target, rect) =
-            calculate_snap_target((1860.0, 500.0).into(), output, 24).unwrap();
+        let (target, rect) = calculate_snap_target((1860.0, 500.0).into(), output, 24).unwrap();
 
         assert_eq!(target, SnapTarget::Right);
         assert_eq!(rect.loc, (966, 12).into());
@@ -293,8 +295,7 @@ mod tests {
     #[test]
     fn pointer_at_top_edge_produces_maximize_target() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
-        let (target, rect) =
-            calculate_snap_target((960.0, 20.0).into(), output, 24).unwrap();
+        let (target, rect) = calculate_snap_target((960.0, 20.0).into(), output, 24).unwrap();
 
         assert_eq!(target, SnapTarget::Maximize);
         assert_eq!(rect, output);
@@ -303,8 +304,7 @@ mod tests {
     #[test]
     fn pointer_at_top_left_prefers_maximize() {
         let output = Rectangle::new((0, 0).into(), (1920, 1080).into());
-        let (target, _) =
-            calculate_snap_target((10.0, 10.0).into(), output, 24).unwrap();
+        let (target, _) = calculate_snap_target((10.0, 10.0).into(), output, 24).unwrap();
 
         assert_eq!(target, SnapTarget::Maximize);
     }

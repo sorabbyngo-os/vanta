@@ -41,7 +41,7 @@ render_elements! {
     >,
 }
 
-fn load_wallpaper() -> Result<MemoryRenderBuffer, Box<dyn std::error::Error>> {
+pub(crate) fn load_wallpaper() -> Result<MemoryRenderBuffer, Box<dyn std::error::Error>> {
     let bytes = include_bytes!("../../../assets/wallpapers/vanta-default.png");
     let decoder = png::Decoder::new(Cursor::new(bytes.as_slice()));
     let mut reader = decoder.read_info()?;
@@ -491,11 +491,6 @@ pub fn init_winit(
 
                         // OutputDamageTracker expects front-to-back elements.
                         // It draws them in reverse: background first, foreground last.
-                        let mut elements = Vec::with_capacity(custom_elements.len() + 32);
-
-                        // Vanta overlays: overview cards, previews and other foreground UI.
-                        elements.append(&mut custom_elements);
-
                         // Render layer-shell surfaces using their arranged LayerMap
                         // positions. Smithay's output helper currently drops those offsets.
                         let output_geometry =
@@ -608,12 +603,12 @@ pub fn init_winit(
                             }
                         }
 
-                        elements.extend(space_elements);
-
-                        // Wallpaper must be behind both the desktop and Vanta overlays.
-                        if let Some(wallpaper) = wallpaper_element {
-                            elements.push(wallpaper);
-                        }
+                        // Compose renderer-created elements in front-to-back order.
+                        let elements = crate::scene::compose_front_to_back(
+                            custom_elements,
+                            space_elements,
+                            wallpaper_element,
+                        );
 
                         let clear_color = if state.overview_open {
                             [0.035, 0.052, 0.078, 1.0]

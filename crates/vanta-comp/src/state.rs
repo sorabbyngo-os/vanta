@@ -14,11 +14,11 @@ use smithay::{
         allocator::Fourcc,
         renderer::element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
     },
-    desktop::{PopupManager, Space, Window, WindowSurfaceType},
+    desktop::{layer_map_for_output, PopupManager, Space, Window, WindowSurfaceType},
     input::{Seat, SeatState},
     output::Output,
     reexports::{
-        calloop::{generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
+        calloop::{channel, generic::Generic, EventLoop, Interest, LoopSignal, Mode, PostAction},
         wayland_server::{
             backend::{ClientData, ClientId, DisconnectReason},
             protocol::wl_surface::WlSurface,
@@ -30,7 +30,7 @@ use smithay::{
         compositor::{with_states, CompositorClientState, CompositorState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
-        shell::wlr_layer::WlrLayerShellState,
+        shell::wlr_layer::{Layer, WlrLayerShellState},
         shell::xdg::{XdgShellState, XdgToplevelSurfaceData},
         shm::ShmState,
         socket::ListeningSocketSource,
@@ -339,6 +339,7 @@ pub struct Vanta {
     pub windows: HashMap<u64, Window>,
     window_ids: WindowIdAllocator,
     pub loop_signal: LoopSignal,
+    pub(crate) native_redraw_sender: Option<channel::Sender<()>>,
 
     // Smithay State
     pub compositor_state: CompositorState,
@@ -379,7 +380,7 @@ impl Vanta {
         let layer_shell_state = WlrLayerShellState::new::<Self>(&dh);
 
         let mut seat_state = SeatState::new();
-        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "winit");
+        let mut seat: Seat<Self> = seat_state.new_wl_seat(&dh, "vanta");
 
         // Notify clients that we have a keyboard, for the sake of the example we assume that keyboard is always present.
         // You may want to track keyboard hot-plug in real compositor.
@@ -430,6 +431,7 @@ impl Vanta {
 
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
+        let native_redraw_sender = None;
 
         Self {
             start_time,
@@ -463,6 +465,7 @@ impl Vanta {
             windows,
             window_ids,
             loop_signal,
+            native_redraw_sender,
             socket_name,
 
             compositor_state,
@@ -507,10 +510,24 @@ impl Vanta {
             .insert_source(
                 Generic::new(display, Interest::READ, Mode::Level),
                 |_, display, state| {
-                    // Safety: we don't drop the display
-                    unsafe {
-                        display.get_mut().dispatch_clients(state).unwrap();
+                    static DISPATCH_LOG_COUNT: std::sync::atomic::AtomicUsize =
+                        std::sync::atomic::AtomicUsize::new(0);
+
+                    // Safety: the display remains owned by the event source.
+                    let dispatched = unsafe { display.get_mut().dispatch_clients(state).unwrap() };
+
+                    let flush_result = state.display_handle.flush_clients();
+
+                    let sequence =
+                        DISPATCH_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    if sequence < 30 {
+                        eprintln!(
+                            "[WAYLAND-DISPATCH] callback={} dispatched={} flush={:?}",
+                            sequence, dispatched, flush_result
+                        );
                     }
+
                     Ok(PostAction::Continue)
                 },
             )
@@ -1173,13 +1190,61 @@ impl Vanta {
         &self,
         pos: Point<f64, Logical>,
     ) -> Option<(WlSurface, Point<f64, Logical>)> {
-        self.space
-            .element_under(pos)
-            .and_then(|(window, location)| {
-                window
-                    .surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
-                    .map(|(s, p)| (s, (p + location).to_f64()))
-            })
+        let output = self.space.outputs().find(|output| {
+            self.space
+                .output_geometry(output)
+                .is_some_and(|geometry| geometry.contains(pos.to_i32_round()))
+        })?;
+        let output_geometry = self.space.output_geometry(output)?;
+        let output_pos = pos - output_geometry.loc.to_f64();
+        let layers = layer_map_for_output(output);
+
+        // Foreground layer-shell surfaces receive input before application windows.
+        if let Some(layer) = layers
+            .layer_under(Layer::Overlay, output_pos)
+            .or_else(|| layers.layer_under(Layer::Top, output_pos))
+        {
+            if let Some(layer_geometry) = layers.layer_geometry(layer) {
+                if let Some((surface, location)) = layer.surface_under(
+                    output_pos - layer_geometry.loc.to_f64(),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((
+                        surface,
+                        (location + layer_geometry.loc + output_geometry.loc).to_f64(),
+                    ));
+                }
+            }
+        }
+
+        // Preserve normal application-window hit-testing.
+        if let Some((window, location)) = self.space.element_under(pos) {
+            if let Some((surface, surface_location)) =
+                window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+            {
+                return Some((surface, (surface_location + location).to_f64()));
+            }
+        }
+
+        // Background layer-shell surfaces are checked after application windows.
+        if let Some(layer) = layers
+            .layer_under(Layer::Bottom, output_pos)
+            .or_else(|| layers.layer_under(Layer::Background, output_pos))
+        {
+            if let Some(layer_geometry) = layers.layer_geometry(layer) {
+                if let Some((surface, location)) = layer.surface_under(
+                    output_pos - layer_geometry.loc.to_f64(),
+                    WindowSurfaceType::ALL,
+                ) {
+                    return Some((
+                        surface,
+                        (location + layer_geometry.loc + output_geometry.loc).to_f64(),
+                    ));
+                }
+            }
+        }
+
+        None
     }
 }
 

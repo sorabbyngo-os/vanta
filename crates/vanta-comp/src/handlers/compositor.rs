@@ -72,6 +72,10 @@ impl CompositorHandler for Vanta {
 
         xdg_shell::handle_commit(&mut self.popups, &self.space, surface);
         resize_grab::handle_commit(&mut self.space, surface);
+
+        if let Some(sender) = self.native_redraw_sender.as_ref() {
+            let _ = sender.send(());
+        }
     }
 }
 
