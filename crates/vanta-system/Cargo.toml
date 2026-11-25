@@ -1,0 +1,16 @@
+[package]
+name = "vanta-system"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+serde = "1"
+futures-timer = "3"
+futures-util = "0.3"
+futures-channel = "0.3"
+zbus = {
+    version = "6.3",
+    default-features = false,
+    features = ["default-rt", "proxy"]
+}

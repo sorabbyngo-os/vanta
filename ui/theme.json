@@ -1,0 +1,19 @@
+{
+  "panel": "90101828",
+  "glass_surface": "603D526D",
+  "glass_highlight": "35FFFFFF",
+  "glass_edge": "557D91B5",
+  "workspace_dot": "A8B9CBE0",
+  "dock": "D91A2030",
+  "surface": "FF252D40",
+  "surface_hover": "FF35415A",
+  "accent": "FF78A9FF",
+  "text": "FFF2F5FC",
+  "text_muted": "FF9AA8BD",
+  "border": "557D91B5",
+  "panel_accent": "6678A9FF",
+  "quick_panel": "F0222427",
+  "quick_card": "FF34373B",
+  "quick_active": "FF45494E",
+  "quick_track": "FF555A61"
+}

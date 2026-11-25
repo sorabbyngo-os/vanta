@@ -1,0 +1,330 @@
+//! Read-only UDisks2 storage event monitoring.
+//!
+//! Monitors ObjectManager interface lifecycle and PropertiesChanged.
+//! No storage mutations are performed.
+
+use std::collections::{HashMap, HashSet};
+use std::thread;
+
+use futures_util::stream::{BoxStream, SelectAll};
+use futures_util::StreamExt;
+use zbus::{Connection, OwnedObjectPath, Proxy};
+
+const BUS: &str = "org.freedesktop.UDisks2";
+const ROOT: &str = "/org/freedesktop/UDisks2";
+const OBJECT_MANAGER: &str = "org.freedesktop.DBus.ObjectManager";
+const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+
+const RELEVANT_INTERFACES: &[&str] = &[
+    "org.freedesktop.UDisks2.Drive",
+    "org.freedesktop.UDisks2.Block",
+    "org.freedesktop.UDisks2.Partition",
+    "org.freedesktop.UDisks2.PartitionTable",
+    "org.freedesktop.UDisks2.Filesystem",
+    "org.freedesktop.UDisks2.Encrypted",
+];
+
+#[derive(Debug, Clone)]
+pub enum StorageEvent {
+    InterfaceAdded {
+        object_path: String,
+        interface: String,
+    },
+    InterfaceRemoved {
+        object_path: String,
+        interface: String,
+    },
+    PropertiesChanged {
+        object_path: String,
+        interface: String,
+        changed_properties: Vec<String>,
+        invalidated_properties: Vec<String>,
+    },
+    MonitorError {
+        message: String,
+    },
+}
+
+enum ManagerEvent {
+    Added {
+        path: String,
+        interfaces: Vec<String>,
+    },
+    Removed {
+        path: String,
+        interfaces: Vec<String>,
+    },
+    Error(String),
+}
+
+fn relevant(interface: &str) -> bool {
+    RELEVANT_INTERFACES.contains(&interface)
+}
+
+async fn property_stream(
+    connection: &Connection,
+    path: String,
+    interface: String,
+) -> Result<BoxStream<'static, StorageEvent>, String> {
+    let proxy = Proxy::new_owned(connection.clone(), BUS, path.clone(), PROPERTIES)
+        .await
+        .map_err(|e| format!("Storage properties proxy {path}: {e}"))?;
+
+    let stream = proxy
+        .receive_signal("PropertiesChanged")
+        .await
+        .map_err(|e| format!("Storage PropertiesChanged subscription {path}: {e}"))?
+        .filter_map(move |message| {
+            let path = path.clone();
+            let expected = interface.clone();
+
+            async move {
+                match message
+                    .body()
+                    .deserialize::<(String, HashMap<String, zbus::OwnedVariant>, Vec<String>)>()
+                {
+                    Ok((changed_interface, changed, invalidated))
+                        if changed_interface == expected =>
+                    {
+                        Some(StorageEvent::PropertiesChanged {
+                            object_path: path,
+                            interface: changed_interface,
+                            changed_properties: changed.into_keys().collect(),
+                            invalidated_properties: invalidated,
+                        })
+                    }
+                    Ok(_) => None,
+                    Err(error) => Some(StorageEvent::MonitorError {
+                        message: format!("Invalid storage PropertiesChanged: {error}"),
+                    }),
+                }
+            }
+        })
+        .boxed();
+
+    Ok(stream)
+}
+
+async fn add_property_streams(
+    connection: &Connection,
+    path: &str,
+    interfaces: &[String],
+    streams: &mut SelectAll<BoxStream<'static, StorageEvent>>,
+    sender: &std::sync::mpsc::Sender<StorageEvent>,
+    active: &mut HashSet<(String, String)>,
+) {
+    for interface in interfaces.iter().filter(|name| relevant(name)) {
+        let key = (path.to_owned(), interface.clone());
+
+        if !active.insert(key) {
+            continue;
+        }
+
+        match property_stream(connection, path.to_owned(), interface.clone()).await {
+            Ok(stream) => streams.push(stream),
+            Err(error) => {
+                active.remove(&(path.to_owned(), interface.clone()));
+                let _ = sender.send(StorageEvent::MonitorError { message: error });
+            }
+        }
+    }
+}
+
+pub fn spawn_storage_monitor() -> Result<std::sync::mpsc::Receiver<StorageEvent>, String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    thread::Builder::new()
+        .name("vanta-storage-events".into())
+        .spawn(move || {
+            let result = zbus::block_on(async {
+                let connection = Connection::system()
+                    .await
+                    .map_err(|e| format!("Storage monitor D-Bus connection: {e}"))?;
+
+                run_monitor(&connection, &sender).await
+            });
+
+            if let Err(error) = result {
+                let _ = sender.send(StorageEvent::MonitorError { message: error });
+            }
+        })
+        .map_err(|e| format!("Could not start storage monitor thread: {e}"))?;
+
+    Ok(receiver)
+}
+
+async fn run_monitor(
+    connection: &Connection,
+    sender: &std::sync::mpsc::Sender<StorageEvent>,
+) -> Result<(), String> {
+    use futures_util::stream::{select, SelectAll};
+
+    let manager = Proxy::new(connection, BUS, ROOT, OBJECT_MANAGER)
+        .await
+        .map_err(|e| format!("UDisks2 ObjectManager proxy: {e}"))?;
+
+    // Subscribe before taking the initial snapshot to avoid missing changes.
+    let added = manager
+        .receive_signal("InterfacesAdded")
+        .await
+        .map_err(|e| format!("UDisks2 InterfacesAdded subscription: {e}"))?
+        .map(|message| {
+            match message.body().deserialize::<(
+                OwnedObjectPath,
+                HashMap<String, HashMap<String, zbus::OwnedVariant>>,
+            )>() {
+                Ok((path, interfaces)) => ManagerEvent::Added {
+                    path: path.to_string(),
+                    interfaces: interfaces.into_keys().collect(),
+                },
+                Err(e) => ManagerEvent::Error(format!("Invalid UDisks2 InterfacesAdded: {e}")),
+            }
+        });
+
+    let removed = manager
+        .receive_signal("InterfacesRemoved")
+        .await
+        .map_err(|e| format!("UDisks2 InterfacesRemoved subscription: {e}"))?
+        .map(|message| {
+            match message
+                .body()
+                .deserialize::<(OwnedObjectPath, Vec<String>)>()
+            {
+                Ok((path, interfaces)) => ManagerEvent::Removed {
+                    path: path.to_string(),
+                    interfaces,
+                },
+                Err(e) => ManagerEvent::Error(format!("Invalid UDisks2 InterfacesRemoved: {e}")),
+            }
+        });
+
+    let mut manager_stream = select(added, removed).boxed().fuse();
+
+    let objects: HashMap<OwnedObjectPath, HashMap<String, HashMap<String, zbus::OwnedVariant>>> =
+        manager
+            .call("GetManagedObjects", &())
+            .await
+            .map_err(|e| format!("UDisks2 GetManagedObjects: {e}"))?;
+
+    let mut property_streams: SelectAll<BoxStream<'static, StorageEvent>> = SelectAll::new();
+    let mut active: HashSet<(String, String)> = HashSet::new();
+
+    for (path, interfaces) in &objects {
+        let names: Vec<String> = interfaces
+            .keys()
+            .filter(|name| relevant(name))
+            .cloned()
+            .collect();
+
+        add_property_streams(
+            connection,
+            path.as_str(),
+            &names,
+            &mut property_streams,
+            sender,
+            &mut active,
+        )
+        .await;
+    }
+
+    loop {
+        if property_streams.is_empty() {
+            match manager_stream.next().await {
+                Some(event) => {
+                    handle_manager_event(
+                        event,
+                        connection,
+                        sender,
+                        &mut property_streams,
+                        &mut active,
+                    )
+                    .await;
+                }
+                None => return Err("UDisks2 ObjectManager stream ended".into()),
+            }
+        } else {
+            futures_util::select! {
+                event = manager_stream.next() => {
+                    match event {
+                        Some(event) => {
+                            handle_manager_event(
+                                event,
+                                connection,
+                                sender,
+                                &mut property_streams,
+                                &mut active,
+                            ).await;
+                        }
+                        None => return Err("UDisks2 ObjectManager stream ended".into()),
+                    }
+                },
+                property_event = property_streams.next() => {
+                    if let Some(event) = property_event {
+                        match &event {
+                            StorageEvent::PropertiesChanged {
+                                object_path,
+                                interface,
+                                ..
+                            } => {
+                                if active.contains(&(object_path.clone(), interface.clone())) {
+                                    let _ = sender.send(event);
+                                }
+                            }
+                            StorageEvent::MonitorError { .. } => {
+                                let _ = sender.send(event);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn handle_manager_event(
+    event: ManagerEvent,
+    connection: &Connection,
+    sender: &std::sync::mpsc::Sender<StorageEvent>,
+    property_streams: &mut SelectAll<BoxStream<'static, StorageEvent>>,
+    active: &mut HashSet<(String, String)>,
+) {
+    match event {
+        ManagerEvent::Error(message) => {
+            let _ = sender.send(StorageEvent::MonitorError { message });
+        }
+        ManagerEvent::Added { path, interfaces } => {
+            let relevant_interfaces: Vec<String> = interfaces
+                .into_iter()
+                .filter(|name| relevant(name))
+                .collect();
+
+            for interface in &relevant_interfaces {
+                let _ = sender.send(StorageEvent::InterfaceAdded {
+                    object_path: path.clone(),
+                    interface: interface.clone(),
+                });
+            }
+
+            add_property_streams(
+                connection,
+                &path,
+                &relevant_interfaces,
+                property_streams,
+                sender,
+                active,
+            )
+            .await;
+        }
+        ManagerEvent::Removed { path, interfaces } => {
+            for interface in interfaces.into_iter().filter(|name| relevant(name)) {
+                active.remove(&(path.clone(), interface.clone()));
+
+                let _ = sender.send(StorageEvent::InterfaceRemoved {
+                    object_path: path.clone(),
+                    interface,
+                });
+            }
+        }
+    }
+}

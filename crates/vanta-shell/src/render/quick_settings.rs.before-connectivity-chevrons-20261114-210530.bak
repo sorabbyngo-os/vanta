@@ -1,0 +1,1046 @@
+use std::{
+    io::Write,
+    process::{Command, Stdio},
+};
+
+use super::{font::FontRenderer, primitives::Canvas, theme::Theme};
+
+const MAX_VISIBLE_WORKSPACES: u32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectivityPanel {
+    #[default]
+    None,
+    Wifi,
+    Bluetooth,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAction {
+    Close,
+    SwitchWorkspace(u32),
+    CreateWorkspace,
+    ToggleWifi,
+    ToggleBluetooth,
+    OpenWifiDetails,
+    OpenBluetoothDetails,
+    BackToControls,
+    RefreshConnectivity,
+    ToggleMute,
+    SetVolumePercent(u32),
+    SetBrightnessPercent(u32),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct WifiNetwork {
+    pub ssid: String,
+    pub signal: u8,
+    pub security: String,
+    pub connected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct BluetoothDevice {
+    pub address: String,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ControlState {
+    pub wifi_enabled: bool,
+    pub wifi_connected: bool,
+    pub bluetooth_powered: bool,
+    pub audio_muted: bool,
+    pub volume: f32,
+    pub brightness_percent: Option<u32>,
+    pub wifi_networks: Vec<WifiNetwork>,
+    pub bluetooth_devices: Vec<BluetoothDevice>,
+}
+
+impl ControlState {
+    pub fn read() -> Self {
+        let wifi_enabled = command_text("nmcli", &["radio", "wifi"])
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("enabled"));
+
+        let wifi_connected = command_text("nmcli", &["-t", "-f", "TYPE,STATE", "device", "status"])
+            .is_some_and(|s| {
+                s.lines().any(|line| {
+                    line.starts_with("wifi:") && line.to_ascii_lowercase().contains("connected")
+                })
+            });
+
+        let bluetooth_powered = command_text("bluetoothctl", &["show"])
+            .is_some_and(|s| s.lines().any(|line| line.trim() == "Powered: yes"));
+
+        let audio = command_text("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]);
+        let audio_muted = audio.as_deref().is_some_and(|s| s.contains("[MUTED]"));
+        let volume = audio
+            .as_deref()
+            .and_then(|s| {
+                s.split_whitespace()
+                    .find_map(|part| part.parse::<f32>().ok())
+            })
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        Self {
+            wifi_enabled,
+            wifi_connected,
+            bluetooth_powered,
+            audio_muted,
+            volume,
+            brightness_percent: read_brightness(),
+            wifi_networks: Vec::new(),
+            bluetooth_devices: Vec::new(),
+        }
+    }
+
+    pub fn refresh(&mut self) -> bool {
+        let mut next = Self::read();
+        next.wifi_networks = self.wifi_networks.clone();
+        next.bluetooth_devices = self.bluetooth_devices.clone();
+
+        let changed = *self != next;
+        *self = next;
+        changed
+    }
+
+    pub fn refresh_connectivity(&mut self) -> bool {
+        let networks = if self.wifi_enabled {
+            read_wifi_networks()
+        } else {
+            Vec::new()
+        };
+        let devices = read_bluetooth_devices();
+
+        let changed = self.wifi_networks != networks || self.bluetooth_devices != devices;
+
+        self.wifi_networks = networks;
+        self.bluetooth_devices = devices;
+        changed
+    }
+
+    pub fn apply_optimistic(&mut self, action: ControlAction) {
+        match action {
+            ControlAction::ToggleWifi => {
+                self.wifi_enabled = !self.wifi_enabled;
+                if !self.wifi_enabled {
+                    self.wifi_connected = false;
+                }
+            }
+            ControlAction::ToggleBluetooth => {
+                self.bluetooth_powered = !self.bluetooth_powered;
+            }
+            ControlAction::ToggleMute => {
+                self.audio_muted = !self.audio_muted;
+            }
+            ControlAction::SetVolumePercent(percent) => {
+                self.volume = percent.min(100) as f32 / 100.0;
+            }
+            ControlAction::SetBrightnessPercent(percent) => {
+                self.brightness_percent = Some(percent.min(100));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn perform(&mut self, action: ControlAction) {
+        let result = match action {
+            ControlAction::ToggleWifi => {
+                let target = if self.wifi_enabled { "off" } else { "on" };
+                self.apply_optimistic(action);
+                run_command("nmcli", &["radio", "wifi", target])
+            }
+            ControlAction::ToggleBluetooth => {
+                let target = if self.bluetooth_powered { "off" } else { "on" };
+                self.apply_optimistic(action);
+                run_command("bluetoothctl", &["power", target])
+            }
+            ControlAction::ToggleMute => {
+                self.apply_optimistic(action);
+                run_command("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+            }
+            ControlAction::SetVolumePercent(percent) => {
+                self.apply_optimistic(action);
+                let target = percent.min(100) as f32 / 100.0;
+                let value = format!("{target:.2}");
+                run_command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value])
+            }
+            ControlAction::SetBrightnessPercent(percent) => {
+                self.apply_optimistic(action);
+                set_brightness_percent(percent)
+            }
+            _ => return,
+        };
+
+        if let Err(error) = result {
+            eprintln!("vanta-shell: control action failed: {error}");
+            self.refresh();
+        } else if matches!(action, ControlAction::SetBrightnessPercent(_)) {
+            // Read back the hardware value after the authorized write.
+            self.refresh();
+        }
+    }
+}
+
+fn split_nmcli_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+        } else {
+            match character {
+                '\\' => escaped = true,
+                ':' => {
+                    fields.push(std::mem::take(&mut current));
+                }
+                other => current.push(other),
+            }
+        }
+    }
+
+    if escaped {
+        current.push('\\');
+    }
+
+    fields.push(current);
+    fields
+}
+
+fn read_wifi_networks() -> Vec<WifiNetwork> {
+    let Some(output) = command_text(
+        "nmcli",
+        &[
+            "--terse",
+            "--escape",
+            "yes",
+            "--fields",
+            "IN-USE,SSID,SIGNAL,SECURITY",
+            "device",
+            "wifi",
+            "list",
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    let mut networks: Vec<WifiNetwork> = Vec::new();
+
+    for line in output.lines() {
+        let fields = split_nmcli_fields(line);
+        if fields.len() < 4 {
+            continue;
+        }
+
+        let connected = fields[0].trim() == "*";
+        let ssid = fields[1].trim().to_owned();
+        if ssid.is_empty() {
+            continue;
+        }
+
+        let signal = fields[2].trim().parse::<u8>().unwrap_or(0).min(100);
+        let security = if fields[3].trim().is_empty() {
+            "Open".to_owned()
+        } else {
+            fields[3].trim().to_owned()
+        };
+
+        if let Some(existing) = networks.iter_mut().find(|item| item.ssid == ssid) {
+            existing.connected |= connected;
+            if signal > existing.signal {
+                existing.signal = signal;
+                existing.security = security;
+            }
+        } else {
+            networks.push(WifiNetwork {
+                ssid,
+                signal,
+                security,
+                connected,
+            });
+        }
+    }
+
+    networks.sort_by(|a, b| {
+        b.connected
+            .cmp(&a.connected)
+            .then_with(|| b.signal.cmp(&a.signal))
+            .then_with(|| a.ssid.to_lowercase().cmp(&b.ssid.to_lowercase()))
+    });
+
+    networks
+}
+
+fn read_bluetooth_devices() -> Vec<BluetoothDevice> {
+    let Some(output) = command_text("bluetoothctl", &["devices"]) else {
+        return Vec::new();
+    };
+
+    let mut devices = Vec::new();
+
+    for line in output.lines() {
+        let Some(rest) = line.trim().strip_prefix("Device ") else {
+            continue;
+        };
+
+        let Some((address, name)) = rest.split_once(' ') else {
+            continue;
+        };
+
+        if address.len() != 17 || name.trim().is_empty() {
+            continue;
+        }
+
+        devices.push(BluetoothDevice {
+            address: address.to_owned(),
+            name: name.trim().to_owned(),
+        });
+    }
+
+    devices.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    devices.dedup_by(|a, b| a.address == b.address);
+    devices
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{program}: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn set_brightness_percent(percent: u32) -> Result<(), String> {
+    const BACKLIGHT: &str = "/sys/class/backlight/intel_backlight/brightness";
+    const MAX_BACKLIGHT: &str = "/sys/class/backlight/intel_backlight/max_brightness";
+
+    let maximum = std::fs::read_to_string(MAX_BACKLIGHT)
+        .map_err(|error| format!("cannot read maximum brightness: {error}"))?
+        .trim()
+        .parse::<u64>()
+        .map_err(|error| format!("invalid maximum brightness: {error}"))?;
+
+    if maximum == 0 {
+        return Err("backlight reports a zero maximum".to_owned());
+    }
+
+    let percent = percent.min(100) as u64;
+    let value = (maximum.saturating_mul(percent) + 50) / 100;
+
+    let mut child = Command::new("pkexec")
+        .arg("/usr/bin/tee")
+        .arg(BACKLIGHT)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("cannot start brightness authorization: {error}"))?;
+
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| "brightness process has no input pipe".to_owned())?
+        .write_all(format!("{value}\n").as_bytes());
+
+    if let Err(error) = write_result {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!("cannot send brightness value: {error}"));
+    }
+
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("brightness authorization failed: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "pkexec brightness write exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn read_brightness() -> Option<u32> {
+    let current = std::fs::read_to_string("/sys/class/backlight/intel_backlight/brightness")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+
+    let maximum = std::fs::read_to_string("/sys/class/backlight/intel_backlight/max_brightness")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+
+    if maximum == 0 {
+        return None;
+    }
+
+    Some((current.saturating_mul(100) / maximum).min(100) as u32)
+}
+
+pub fn draw(
+    canvas: &mut Canvas<'_>,
+    font: &FontRenderer,
+    width: u32,
+    height: u32,
+    workspace_count: u32,
+    active_workspace: u32,
+    state: &ControlState,
+    colors: &Theme,
+    expanded: ConnectivityPanel,
+) {
+    if width < 100 || height < 100 {
+        return;
+    }
+
+    let w = width as f32;
+    let h = height as f32;
+
+    // Dark graphite popup. Individual surfaces provide separation;
+    // avoid full-width decorative borders and divider lines.
+    canvas.rounded_rect_f(2.0, 2.0, w - 4.0, h - 4.0, 29.0, colors.quick_panel);
+    canvas.rounded_rect_f(4.0, 4.0, w - 8.0, 1.0, 0.5, 0x20FFFFFF);
+
+    // Header
+    let (header_title, header_subtitle) = match expanded {
+        ConnectivityPanel::None => ("Quick Settings", "System controls"),
+        ConnectivityPanel::Wifi => ("Wi-Fi", "Network connections"),
+        ConnectivityPanel::Bluetooth => ("Bluetooth", "Nearby devices"),
+    };
+
+    font.draw_text(canvas, 18.0, 37.0, header_title, colors.text, 20.0);
+    font.draw_text(canvas, 19.0, 56.0, header_subtitle, colors.text_muted, 10.0);
+
+    canvas.rounded_rect_f(w - 66.0, 14.0, 48.0, 30.0, 15.0, 0x704A4A52);
+    font.draw_text(canvas, w - 56.0, 33.0, "Close", colors.text, 10.0);
+
+    // Expanded connectivity screens replace the controls instead of
+    // appearing underneath them.
+    if expanded != ConnectivityPanel::None {
+        canvas.rounded_rect_f(16.0, 72.0, 112.0, 36.0, 16.0, 0x704A4A52);
+        font.draw_text(canvas, 29.0, 95.0, "< Controls", colors.text, 11.0);
+
+        canvas.rounded_rect_f(266.0, 72.0, 94.0, 36.0, 16.0, colors.quick_active);
+        font.draw_text(canvas, 283.0, 95.0, "Refresh", colors.text, 11.0);
+
+        match expanded {
+            ConnectivityPanel::Wifi => {
+                let status = if !state.wifi_enabled {
+                    "Wi-Fi is turned off"
+                } else if state.wifi_connected {
+                    "Connected network appears first"
+                } else {
+                    "Available nearby networks"
+                };
+
+                font.draw_text(canvas, 20.0, 139.0, status, colors.text_muted, 10.0);
+                font.draw_text(canvas, 20.0, 164.0, "NETWORKS", colors.text_muted, 9.0);
+
+                if !state.wifi_enabled {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        204.0,
+                        "Turn on Wi-Fi to discover networks",
+                        colors.text,
+                        11.0,
+                    );
+                } else if state.wifi_networks.is_empty() {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        204.0,
+                        "No networks found. Select Refresh to scan again.",
+                        colors.text_muted,
+                        10.0,
+                    );
+                } else {
+                    for (index, network) in state.wifi_networks.iter().take(7).enumerate() {
+                        let y = 176.0 + index as f32 * 44.0;
+                        canvas.rounded_rect_f(
+                            16.0,
+                            y,
+                            344.0,
+                            39.0,
+                            12.0,
+                            if network.connected {
+                                0x80426BA8
+                            } else {
+                                0x704A4A52
+                            },
+                        );
+
+                        font.draw_text(
+                            canvas,
+                            28.0,
+                            y + 16.0,
+                            &truncate_label(&network.ssid, 39),
+                            colors.text,
+                            11.0,
+                        );
+
+                        let meta = if network.connected {
+                            format!("Connected · {}% signal", network.signal)
+                        } else {
+                            format!("{}% signal · {}", network.signal, network.security)
+                        };
+
+                        font.draw_text(
+                            canvas,
+                            28.0,
+                            y + 31.0,
+                            &truncate_label(&meta, 48),
+                            colors.text_muted,
+                            9.0,
+                        );
+                    }
+                }
+            }
+            ConnectivityPanel::Bluetooth => {
+                let status = if state.bluetooth_powered {
+                    "Bluetooth is on"
+                } else {
+                    "Bluetooth is turned off"
+                };
+
+                font.draw_text(canvas, 20.0, 139.0, status, colors.text_muted, 10.0);
+                font.draw_text(canvas, 20.0, 164.0, "KNOWN DEVICES", colors.text_muted, 9.0);
+
+                if !state.bluetooth_powered {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        204.0,
+                        "Turn on Bluetooth to discover devices",
+                        colors.text,
+                        11.0,
+                    );
+                } else if state.bluetooth_devices.is_empty() {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        204.0,
+                        "No known devices found. Select Refresh to scan again.",
+                        colors.text_muted,
+                        10.0,
+                    );
+                } else {
+                    for (index, device) in state.bluetooth_devices.iter().take(7).enumerate() {
+                        let y = 176.0 + index as f32 * 44.0;
+                        canvas.rounded_rect_f(16.0, y, 344.0, 39.0, 12.0, 0x704A4A52);
+
+                        font.draw_text(
+                            canvas,
+                            28.0,
+                            y + 16.0,
+                            &truncate_label(&device.name, 38),
+                            colors.text,
+                            11.0,
+                        );
+                        font.draw_text(
+                            canvas,
+                            28.0,
+                            y + 31.0,
+                            &device.address,
+                            colors.text_muted,
+                            9.0,
+                        );
+                    }
+                }
+            }
+            ConnectivityPanel::None => unreachable!(),
+        }
+
+        return;
+    }
+
+    // Connectivity tiles
+    draw_tile(
+        canvas,
+        font,
+        colors,
+        16.0,
+        72.0,
+        166.0,
+        66.0,
+        "Wi-Fi",
+        if state.wifi_enabled {
+            if state.wifi_connected {
+                "Connected"
+            } else {
+                "Enabled · not connected"
+            }
+        } else {
+            "Off"
+        },
+        state.wifi_enabled,
+    );
+
+    draw_tile(
+        canvas,
+        font,
+        colors,
+        194.0,
+        72.0,
+        166.0,
+        66.0,
+        "Bluetooth",
+        if state.bluetooth_powered { "On" } else { "Off" },
+        state.bluetooth_powered,
+    );
+
+    // Audio card
+    canvas.rounded_rect_f(16.0, 150.0, 344.0, 82.0, 20.0, 0x704A4A52);
+
+    font.draw_text(canvas, 28.0, 172.0, "Sound output", colors.text, 13.0);
+    font.draw_text(
+        canvas,
+        28.0,
+        190.0,
+        if state.audio_muted {
+            "Muted"
+        } else {
+            "Output active"
+        },
+        colors.text_muted,
+        10.0,
+    );
+
+    // Mute remains a separate working action.
+    canvas.rounded_rect_f(
+        26.0,
+        197.0,
+        70.0,
+        27.0,
+        13.5,
+        if state.audio_muted {
+            colors.quick_active
+        } else {
+            0xFF41454A
+        },
+    );
+    font.draw_text(
+        canvas,
+        39.0,
+        215.0,
+        if state.audio_muted { "Unmute" } else { "Mute" },
+        colors.text,
+        10.0,
+    );
+
+    // Volume slider: coordinates are shared with main.rs hit testing.
+    let slider_x = 112.0_f32;
+    let slider_width = 176.0_f32;
+    let slider_y = 210.0_f32;
+    let volume = state.volume.clamp(0.0, 1.0);
+
+    canvas.rounded_rect_f(slider_x, slider_y - 3.0, slider_width, 6.0, 3.0, 0xFF3A3A40);
+
+    if volume > 0.0 {
+        canvas.rounded_rect_f(
+            slider_x,
+            slider_y - 3.0,
+            slider_width * volume,
+            6.0,
+            3.0,
+            0xFF2196F3,
+        );
+    }
+
+    let thumb_x = slider_x + slider_width * volume;
+    canvas.rounded_rect_f(
+        (thumb_x - 6.0).clamp(slider_x - 1.0, slider_x + slider_width - 11.0),
+        slider_y - 8.0,
+        12.0,
+        16.0,
+        6.0,
+        0xFFF5F7F8,
+    );
+
+    font.draw_text(
+        canvas,
+        307.0,
+        215.0,
+        &format!("{:.0}%", volume * 100.0),
+        colors.text,
+        11.0,
+    );
+
+    // Display brightness slider.
+    canvas.rounded_rect_f(16.0, 244.0, 344.0, 58.0, 19.0, 0x704A4A52);
+    font.draw_text(canvas, 28.0, 267.0, "Display brightness", colors.text, 12.0);
+
+    let brightness = state
+        .brightness_percent
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "Unavailable".to_string());
+
+    font.draw_text(canvas, 296.0, 267.0, &brightness, colors.text_muted, 11.0);
+
+    if let Some(value) = state.brightness_percent {
+        let track_x = 28.0;
+        let track_width = 320.0;
+        canvas.rounded_rect_f(track_x, 282.0, track_width, 4.0, 2.0, colors.quick_track);
+
+        let progress_width = track_width * value as f32 / 100.0;
+        if progress_width > 0.0 {
+            canvas.rounded_rect_f(track_x, 282.0, progress_width, 4.0, 2.0, colors.accent);
+        }
+
+        // White thumb, centered on the current brightness value.
+        let thumb_x = (track_x + progress_width).clamp(track_x, track_x + track_width);
+        canvas.rounded_rect_f(thumb_x - 6.0, 278.0, 12.0, 12.0, 6.0, colors.text);
+    }
+
+    if expanded == ConnectivityPanel::None {
+        // Workspaces
+        font.draw_text(canvas, 19.0, 329.0, "Workspaces", colors.text, 14.0);
+
+        if workspace_count > MAX_VISIBLE_WORKSPACES {
+            font.draw_text(
+                canvas,
+                w - 100.0,
+                329.0,
+                &format!("{workspace_count} total"),
+                colors.text_muted,
+                10.0,
+            );
+        }
+
+        let visible_count = workspace_count.min(MAX_VISIBLE_WORKSPACES);
+
+        for index in 0..visible_count {
+            let column = index % 5;
+            let row = index / 5;
+            let x = 16.0 + column as f32 * 69.0;
+            let y = 340.0 + row as f32 * 42.0;
+            let active = index == active_workspace;
+
+            canvas.rounded_rect_f(
+                x,
+                y,
+                62.0,
+                34.0,
+                12.0,
+                if active { 0xFF287FC5 } else { 0x704A4A52 },
+            );
+
+            let label = format!("{}", index + 1);
+            let label_width = font.text_width(&label, 14.0);
+            font.draw_text(
+                canvas,
+                x + (62.0 - label_width) * 0.5,
+                y + 22.0,
+                &label,
+                colors.text,
+                14.0,
+            );
+
+            if active {
+                canvas.rounded_rect_f(x + 24.0, y + 28.0, 14.0, 2.0, 1.0, colors.accent);
+            }
+        }
+
+        canvas.rounded_rect_f(16.0, 430.0, w - 32.0, 34.0, 17.0, 0x704A4A52);
+        font.draw_text(canvas, 29.0, 452.0, "New workspace", colors.text, 12.0);
+    } else {
+        let (title, status) = match expanded {
+            ConnectivityPanel::Wifi => (
+                "Wi-Fi networks",
+                if !state.wifi_enabled {
+                    "Wi-Fi is turned off"
+                } else if state.wifi_connected {
+                    "Connected network shown first"
+                } else {
+                    "Available nearby networks"
+                },
+            ),
+            ConnectivityPanel::Bluetooth => (
+                "Bluetooth devices",
+                if state.bluetooth_powered {
+                    "Known devices"
+                } else {
+                    "Bluetooth is turned off"
+                },
+            ),
+            ConnectivityPanel::None => unreachable!(),
+        };
+
+        font.draw_text(canvas, 19.0, 329.0, title, colors.text, 14.0);
+        canvas.rounded_rect_f(16.0, 340.0, 344.0, 38.0, 16.0, 0x704A4A52);
+        font.draw_text(
+            canvas,
+            29.0,
+            364.0,
+            "Back to Quick Settings",
+            colors.text,
+            12.0,
+        );
+        font.draw_text(canvas, 20.0, 399.0, status, colors.text_muted, 10.0);
+
+        match expanded {
+            ConnectivityPanel::Wifi => {
+                if !state.wifi_enabled {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        438.0,
+                        "Turn on Wi-Fi to discover networks",
+                        colors.text_muted,
+                        10.0,
+                    );
+                } else if state.wifi_networks.is_empty() {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        438.0,
+                        "No networks found. Open this panel to scan again.",
+                        colors.text_muted,
+                        9.0,
+                    );
+                } else {
+                    for (index, network) in state.wifi_networks.iter().take(3).enumerate() {
+                        let y = 410.0 + index as f32 * 35.0;
+                        canvas.rounded_rect_f(
+                            16.0,
+                            y,
+                            344.0,
+                            31.0,
+                            11.0,
+                            if network.connected {
+                                0x80426BA8
+                            } else {
+                                0x704A4A52
+                            },
+                        );
+
+                        let name = truncate_label(&network.ssid, 25);
+                        font.draw_text(canvas, 27.0, y + 14.0, &name, colors.text, 10.0);
+                        let meta = if network.connected {
+                            format!("Connected · {}%", network.signal)
+                        } else {
+                            format!("{}% · {}", network.signal, network.security)
+                        };
+                        font.draw_text(
+                            canvas,
+                            27.0,
+                            y + 26.0,
+                            &truncate_label(&meta, 43),
+                            colors.text_muted,
+                            8.0,
+                        );
+                    }
+                }
+            }
+            ConnectivityPanel::Bluetooth => {
+                if !state.bluetooth_powered {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        438.0,
+                        "Turn on Bluetooth to use nearby devices",
+                        colors.text_muted,
+                        10.0,
+                    );
+                } else if state.bluetooth_devices.is_empty() {
+                    font.draw_text(
+                        canvas,
+                        20.0,
+                        438.0,
+                        "No known devices found",
+                        colors.text_muted,
+                        10.0,
+                    );
+                } else {
+                    for (index, device) in state.bluetooth_devices.iter().take(3).enumerate() {
+                        let y = 410.0 + index as f32 * 35.0;
+                        canvas.rounded_rect_f(16.0, y, 344.0, 31.0, 11.0, 0x704A4A52);
+                        font.draw_text(
+                            canvas,
+                            27.0,
+                            y + 14.0,
+                            &truncate_label(&device.name, 34),
+                            colors.text,
+                            10.0,
+                        );
+                        font.draw_text(
+                            canvas,
+                            27.0,
+                            y + 26.0,
+                            &device.address,
+                            colors.text_muted,
+                            8.0,
+                        );
+                    }
+                }
+            }
+            ConnectivityPanel::None => unreachable!(),
+        }
+    }
+}
+
+fn truncate_label(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let result: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{result}…")
+    } else {
+        result
+    }
+}
+
+fn draw_tile(
+    canvas: &mut Canvas<'_>,
+    font: &FontRenderer,
+    colors: &Theme,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    title: &str,
+    status: &str,
+    active: bool,
+) {
+    canvas.rounded_rect_f(
+        x,
+        y,
+        width,
+        height,
+        17.0,
+        if active { 0xFF287FC5 } else { 0x704A4A52 },
+    );
+
+    font.draw_text(canvas, x + 14.0, y + 28.0, title, colors.text, 15.0);
+    font.draw_text(canvas, x + 14.0, y + 49.0, status, colors.text_muted, 10.0);
+
+    let switch_x = x + width - 43.0;
+    canvas.rounded_rect_f(
+        switch_x,
+        y + 22.0,
+        30.0,
+        18.0,
+        9.0,
+        if active { 0xFF174F7D } else { 0xFF343A43 },
+    );
+    canvas.rounded_rect_f(
+        if active {
+            switch_x + 15.0
+        } else {
+            switch_x + 3.0
+        },
+        y + 25.0,
+        12.0,
+        12.0,
+        6.0,
+        colors.text,
+    );
+}
+
+pub fn hit_test(
+    width: u32,
+    _height: u32,
+    x: f64,
+    y: f64,
+    workspace_count: u32,
+    expanded: ConnectivityPanel,
+) -> Option<ControlAction> {
+    if x >= width.saturating_sub(66) as f64
+        && x < width.saturating_sub(18) as f64
+        && (14.0..44.0).contains(&y)
+    {
+        return Some(ControlAction::Close);
+    }
+
+    if expanded != ConnectivityPanel::None {
+        if (16.0..128.0).contains(&x) && (72.0..108.0).contains(&y) {
+            return Some(ControlAction::BackToControls);
+        }
+
+        if (266.0..360.0).contains(&x) && (72.0..108.0).contains(&y) {
+            return Some(ControlAction::RefreshConnectivity);
+        }
+
+        return None;
+    }
+
+    if (16.0..182.0).contains(&x) && (72.0..138.0).contains(&y) {
+        return Some(if x >= 139.0 {
+            ControlAction::ToggleWifi
+        } else {
+            ControlAction::OpenWifiDetails
+        });
+    }
+
+    if (194.0..360.0).contains(&x) && (72.0..138.0).contains(&y) {
+        return Some(if x >= 317.0 {
+            ControlAction::ToggleBluetooth
+        } else {
+            ControlAction::OpenBluetoothDetails
+        });
+    }
+
+    if (26.0..96.0).contains(&x) && (194.0..228.0).contains(&y) {
+        return Some(ControlAction::ToggleMute);
+    }
+
+    if (108.0..294.0).contains(&x) && (194.0..228.0).contains(&y) {
+        let percent = (((x - 112.0) / 176.0) * 100.0).round().clamp(0.0, 100.0) as u32;
+
+        return Some(ControlAction::SetVolumePercent(percent));
+    }
+
+    // Brightness track: x=28..348, centered at y=282.
+    if (28.0..348.0).contains(&x) && (274.0..296.0).contains(&y) {
+        let percent = (((x - 28.0) / 320.0) * 100.0).round().clamp(0.0, 100.0) as u32;
+        return Some(ControlAction::SetBrightnessPercent(percent));
+    }
+
+    if (16.0..360.0).contains(&x) && (340.0..416.0).contains(&y) {
+        let column = ((x - 16.0) / 69.0) as u32;
+        let row = ((y - 340.0) / 42.0) as u32;
+        let local_x = (x - 16.0) - column as f64 * 69.0;
+        let local_y = (y - 340.0) - row as f64 * 42.0;
+        let index = row * 5 + column;
+
+        if column < 5
+            && row < 2
+            && local_x < 62.0
+            && local_y < 34.0
+            && index < workspace_count.min(MAX_VISIBLE_WORKSPACES)
+        {
+            return Some(ControlAction::SwitchWorkspace(index));
+        }
+    }
+
+    if (16.0..360.0).contains(&x) && (430.0..464.0).contains(&y) {
+        return Some(ControlAction::CreateWorkspace);
+    }
+
+    None
+}

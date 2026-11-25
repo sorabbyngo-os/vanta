@@ -17,15 +17,17 @@ use std::{
 use smithay::{
     backend::{
         allocator::{
+            dmabuf::Dmabuf,
             gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
             Fourcc,
         },
         drm::{
             compositor::{DrmCompositor, FrameFlags, PrimaryPlaneElement},
             exporter::gbm::{GbmFramebufferExporter, NodeFilter},
-            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode,
+            DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType,
         },
         egl::{EGLContext, EGLDisplay},
+        libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{element::surface::WaylandSurfaceRenderElement, gles::GlesRenderer, ImportDma},
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
         udev::{UdevBackend, UdevEvent},
@@ -37,6 +39,7 @@ use smithay::{
         wayland_server::backend::GlobalId,
     },
     utils::DeviceFd,
+    wayland::dmabuf::DmabufFeedbackBuilder,
 };
 use smithay::{
     output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel},
@@ -57,8 +60,11 @@ use smithay::backend::renderer::element::{
 };
 use smithay::utils::{IsAlive, Logical, Point, Rectangle, Scale};
 
-use crate::state::create_overview_glass_buffer;
 use crate::Vanta;
+use crate::{
+    motion_render::{render_animated_windows, AnimatedWindowElement},
+    state::create_overview_glass_buffer,
+};
 
 type NativeDrmCompositor =
     DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
@@ -72,6 +78,7 @@ render_elements! {
         GlesRenderer,
         NativeSurfaceElement<GlesRenderer>
     >,
+    Animated=AnimatedWindowElement,
     Thumbnail=CropRenderElement<
         RelocateRenderElement<
             RescaleRenderElement<NativeSurfaceElement<GlesRenderer>>
@@ -98,6 +105,38 @@ struct NativeDrmDevice {
     outputs: Vec<NativeOutput>,
     session_fd: DeviceFd,
     notifier_token: RegistrationToken,
+}
+
+#[derive(Clone)]
+pub(crate) struct NativeRendererRegistry {
+    devices: Rc<RefCell<HashMap<DrmNode, NativeDrmDevice>>>,
+    active_node: Rc<RefCell<Option<DrmNode>>>,
+}
+
+impl NativeRendererRegistry {
+    pub(crate) fn import_dmabuf(&self, dmabuf: &Dmabuf) -> bool {
+        let Some(node) = *self.active_node.borrow() else {
+            return false;
+        };
+
+        let mut devices = self.devices.borrow_mut();
+        let Some(renderer) = devices
+            .get_mut(&node)
+            .and_then(|device| device.renderer.as_mut())
+        else {
+            return false;
+        };
+
+        if renderer.import_dmabuf(dmabuf, None).is_err() {
+            return false;
+        }
+
+        if dmabuf.node().is_none() {
+            dmabuf.set_node(node);
+        }
+
+        true
+    }
 }
 
 pub(crate) struct NativeSession {
@@ -284,6 +323,10 @@ fn sync_native_output(
         state.space.unmap_output(&previous);
     }
 
+    if let Some(registry) = &state.native_renderer_registry {
+        *registry.active_node.borrow_mut() = None;
+    }
+
     let candidate = devices.iter().find_map(|(node, device)| {
         if device.renderer.is_none() {
             return None;
@@ -308,6 +351,10 @@ fn sync_native_output(
         info!("No active native DRM output is currently available");
         return;
     };
+
+    if let Some(registry) = &state.native_renderer_registry {
+        *registry.active_node.borrow_mut() = Some(node);
+    }
 
     let (width, height) = drm_mode.size();
     let refresh = i32::try_from(drm_mode.vrefresh().saturating_mul(1000)).unwrap_or(60_000);
@@ -370,6 +417,31 @@ fn sync_native_output(
     };
 
     let renderer_formats = renderer.dmabuf_formats();
+
+    let render_node = node
+        .node_with_type(NodeType::Render)
+        .and_then(Result::ok)
+        .unwrap_or(node);
+
+    match DmabufFeedbackBuilder::new(render_node.dev_id(), renderer_formats.clone()).build() {
+        Ok(feedback) => {
+            if let Some(global) = state.dmabuf_global {
+                state.dmabuf_state.set_default_feedback(&global, &feedback);
+            } else {
+                state.dmabuf_global = Some(
+                    state
+                        .dmabuf_state
+                        .create_global_with_default_feedback::<Vanta>(
+                            &state.display_handle,
+                            &feedback,
+                        ),
+                );
+            }
+        }
+        Err(err) => {
+            warn!(?node, ?err, "Failed to build native DMA-BUF feedback");
+        }
+    }
     let allocator = GbmAllocator::new(
         device._gbm.clone(),
         GbmBufferFlags::RENDERING | GbmBufferFlags::SCANOUT,
@@ -797,10 +869,8 @@ fn render_native_scene(
 
     if !state.overview_open {
         let windows =
-            state
-                .space
-                .render_elements_for_region(renderer, &output_geometry, scale, 1.0);
-        desktop_elements.extend(windows.into_iter().map(NativeSceneElements::Surface));
+            render_animated_windows(state, renderer, &output_geometry, Scale::from(scale), 1.0);
+        desktop_elements.extend(windows.into_iter().map(NativeSceneElements::Animated));
     }
 
     for (layer, geometry) in back_layers {
@@ -1119,11 +1189,37 @@ pub(crate) fn init_native(
 
     info!(seat = %seat_name, "Acquired native libseat session");
 
+    // Route physical keyboard, pointer, and touch events through libinput.
+    // The cloned session handle shares the existing libseat session.
+    let mut libinput = smithay::reexports::input::Libinput::new_with_udev(
+        LibinputSessionInterface::from(session.borrow().clone()),
+    );
+    libinput.udev_assign_seat(&seat_name).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Failed to assign libinput to the active seat",
+        )
+    })?;
+
+    event_loop.handle().insert_source(
+        LibinputInputBackend::new(libinput),
+        move |event, _, state: &mut Vanta| {
+            state.process_input_event(event);
+            if let Some(sender) = state.native_redraw_sender.as_ref() {
+                let _ = sender.send(());
+            }
+        },
+    )?;
+
     let udev_backend = UdevBackend::new(&seat_name)?;
     info!(seat = %seat_name, "Initialized native Udev backend");
 
     let devices: Rc<RefCell<HashMap<DrmNode, NativeDrmDevice>>> =
         Rc::new(RefCell::new(HashMap::new()));
+    state.native_renderer_registry = Some(NativeRendererRegistry {
+        devices: Rc::clone(&devices),
+        active_node: Rc::new(RefCell::new(None)),
+    });
     let device_paths: Rc<RefCell<HashMap<DrmNode, PathBuf>>> =
         Rc::new(RefCell::new(HashMap::new()));
 
@@ -1135,6 +1231,13 @@ pub(crate) fn init_native(
         .handle()
         .insert_source(redraw_receiver, move |event, _, state: &mut Vanta| {
             if let channel::Event::Msg(()) = event {
+                let motion_active = state.advance_motion();
+                if motion_active {
+                    if let Some(sender) = state.native_redraw_sender.as_ref() {
+                        let _ = sender.send(());
+                    }
+                }
+
                 let mut devices = devices_for_redraw.borrow_mut();
                 let targets: Vec<(DrmNode, crtc::Handle)> = devices
                     .iter()

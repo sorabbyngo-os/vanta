@@ -1,0 +1,74 @@
+//! Native session and device-discovery bootstrap.
+//!
+//! This is deliberately limited to session ownership and Udev discovery.
+//! DRM device opening, output creation, input forwarding and rendering are
+//! separate milestones.
+
+use std::error::Error;
+
+use smithay::{
+    backend::{
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        udev::{UdevBackend, UdevEvent},
+    },
+    reexports::calloop::EventLoop,
+};
+use tracing::{info, warn};
+
+use crate::Vanta;
+
+/// Keeps the libseat session alive while the native backend is running.
+pub(crate) struct NativeSession {
+    _session: LibSeatSession,
+}
+
+/// Acquire the active seat and register its Udev device event source.
+///
+/// This first milestone discovers DRM device lifecycle events. It does not
+/// open devices or create DRM outputs yet.
+pub(crate) fn init_native(
+    event_loop: &mut EventLoop<Vanta>,
+) -> Result<NativeSession, Box<dyn Error>> {
+    let (session, notifier) = LibSeatSession::new()?;
+    let seat_name = session.seat();
+
+    info!(seat = %seat_name, "Acquired native libseat session");
+
+    let udev_backend = UdevBackend::new(&seat_name)?;
+    info!(seat = %seat_name, "Initialized native Udev backend");
+
+    event_loop
+        .handle()
+        .insert_source(
+            notifier,
+            move |event, &mut (), _state: &mut Vanta| match event {
+                SessionEvent::PauseSession => {
+                    info!("Native session paused");
+                }
+                SessionEvent::ActivateSession => {
+                    info!("Native session activated");
+                }
+            },
+        )?;
+
+    event_loop.handle().insert_source(
+        udev_backend,
+        move |event, _, _state: &mut Vanta| match event {
+            UdevEvent::Added { device_id, path } => {
+                info!(
+                    ?device_id,
+                    path = %path.display(),
+                    "Udev device added"
+                );
+            }
+            UdevEvent::Changed { device_id } => {
+                info!(?device_id, "Udev device changed");
+            }
+            UdevEvent::Removed { device_id } => {
+                warn!(?device_id, "Udev device removed");
+            }
+        },
+    )?;
+
+    Ok(NativeSession { _session: session })
+}

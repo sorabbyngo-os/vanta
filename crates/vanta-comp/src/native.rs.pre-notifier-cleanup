@@ -1,0 +1,228 @@
+//! Native session and DRM device lifecycle.
+//!
+//! This milestone handles libseat ownership, Udev discovery, DRM device
+//! opening, GBM initialization, notifier registration, and device removal.
+//! EGL, outputs, input forwarding, and rendering are separate milestones.
+
+use std::{
+    cell::RefCell, collections::HashMap, error::Error, os::unix::io::OwnedFd, path::Path, rc::Rc,
+};
+
+use smithay::{
+    backend::{
+        allocator::gbm::GbmDevice,
+        drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode},
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        udev::{UdevBackend, UdevEvent},
+    },
+    reexports::{
+        calloop::{EventLoop, LoopHandle, RegistrationToken},
+        rustix::fs::OFlags,
+    },
+    utils::DeviceFd,
+};
+use tracing::{error, info, warn};
+
+use crate::Vanta;
+
+struct NativeDrmDevice {
+    _drm: DrmDevice,
+    _gbm: GbmDevice<DrmDeviceFd>,
+    session_fd: DeviceFd,
+    notifier_token: RegistrationToken,
+}
+
+pub(crate) struct NativeSession {
+    _session: Rc<RefCell<LibSeatSession>>,
+}
+
+fn close_session_device(session: &Rc<RefCell<LibSeatSession>>, fd: DeviceFd) {
+    let owned_fd: OwnedFd = match fd.try_into() {
+        Ok(fd) => fd,
+        Err(fd) => {
+            error!(
+                raw_fd = std::os::unix::io::AsRawFd::as_raw_fd(&fd),
+                "Cannot close DRM device: device FD still has outstanding owners"
+            );
+            return;
+        }
+    };
+
+    if let Err(err) = session.borrow_mut().close(owned_fd) {
+        warn!(?err, "Failed to close DRM device through libseat");
+    }
+}
+
+fn add_drm_device(
+    node: DrmNode,
+    path: &Path,
+    session: &Rc<RefCell<LibSeatSession>>,
+    handle: &LoopHandle<'_, Vanta>,
+    devices: &mut HashMap<DrmNode, NativeDrmDevice>,
+) -> Result<(), Box<dyn Error>> {
+    if devices.contains_key(&node) {
+        info!(?node, "DRM device already registered");
+        return Ok(());
+    }
+
+    let owned_fd = session.borrow_mut().open(
+        path,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOCTTY | OFlags::NONBLOCK,
+    )?;
+
+    let session_fd = DeviceFd::from(owned_fd);
+    let drm_fd = DrmDeviceFd::new(session_fd.clone());
+
+    let (drm, notifier) = match DrmDevice::new(drm_fd.clone(), true) {
+        Ok(result) => result,
+        Err(err) => {
+            drop(drm_fd);
+            close_session_device(session, session_fd);
+            return Err(Box::new(err));
+        }
+    };
+
+    let gbm = match GbmDevice::new(drm_fd.clone()) {
+        Ok(gbm) => gbm,
+        Err(err) => {
+            drop(drm);
+            drop(drm_fd);
+            close_session_device(session, session_fd);
+            return Err(Box::new(err));
+        }
+    };
+
+    drop(drm_fd);
+
+    let notifier_token = match handle.insert_source(
+        notifier,
+        move |event, _metadata, _state: &mut Vanta| match event {
+            DrmEvent::VBlank(crtc) => {
+                tracing::trace!(?node, ?crtc, "Native DRM vblank");
+            }
+            DrmEvent::Error(err) => {
+                error!(?node, ?err, "Native DRM event error");
+            }
+        },
+    ) {
+        Ok(token) => token,
+        Err(err) => {
+            drop(drm);
+            drop(gbm);
+            close_session_device(session, session_fd);
+            return Err(Box::new(err));
+        }
+    };
+
+    devices.insert(
+        node,
+        NativeDrmDevice {
+            _drm: drm,
+            _gbm: gbm,
+            session_fd,
+            notifier_token,
+        },
+    );
+
+    info!(?node, path = %path.display(), "Registered native DRM/GBM device");
+    Ok(())
+}
+
+fn remove_drm_device(
+    node: DrmNode,
+    session: &Rc<RefCell<LibSeatSession>>,
+    handle: &LoopHandle<'_, Vanta>,
+    devices: &mut HashMap<DrmNode, NativeDrmDevice>,
+) {
+    let Some(device) = devices.remove(&node) else {
+        return;
+    };
+
+    handle.remove(device.notifier_token);
+
+    let NativeDrmDevice {
+        _drm,
+        _gbm,
+        session_fd,
+        notifier_token: _,
+    } = device;
+
+    drop(_drm);
+    drop(_gbm);
+
+    close_session_device(session, session_fd);
+    info!(?node, "Removed native DRM/GBM device");
+}
+
+pub(crate) fn init_native(
+    event_loop: &mut EventLoop<Vanta>,
+) -> Result<NativeSession, Box<dyn Error>> {
+    let (session, notifier) = LibSeatSession::new()?;
+    let seat_name = session.seat();
+    let session = Rc::new(RefCell::new(session));
+
+    info!(seat = %seat_name, "Acquired native libseat session");
+
+    let udev_backend = UdevBackend::new(&seat_name)?;
+    info!(seat = %seat_name, "Initialized native Udev backend");
+
+    event_loop
+        .handle()
+        .insert_source(
+            notifier,
+            move |event, &mut (), _state: &mut Vanta| match event {
+                SessionEvent::PauseSession => {
+                    warn!("Native libseat session paused");
+                }
+                SessionEvent::ActivateSession => {
+                    info!("Native libseat session activated");
+                }
+            },
+        )?;
+
+    let session_for_udev = Rc::clone(&session);
+    let handle = event_loop.handle();
+    let mut devices: HashMap<DrmNode, NativeDrmDevice> = HashMap::new();
+
+    event_loop.handle().insert_source(
+        udev_backend,
+        move |event, _, _state: &mut Vanta| match event {
+            UdevEvent::Added { device_id, path } => match DrmNode::from_dev_id(device_id) {
+                Ok(node) => {
+                    if let Err(err) =
+                        add_drm_device(node, &path, &session_for_udev, &handle, &mut devices)
+                    {
+                        warn!(
+                            ?node,
+                            path = %path.display(),
+                            ?err,
+                            "Failed to initialize native DRM device"
+                        );
+                    }
+                }
+                Err(err) => {
+                    warn!(?device_id, ?err, "Udev device is not a usable DRM node");
+                }
+            },
+            UdevEvent::Changed { device_id } => match DrmNode::from_dev_id(device_id) {
+                Ok(node) if devices.contains_key(&node) => {
+                    info!(?node, "Native DRM device changed");
+                }
+                Ok(node) => {
+                    tracing::debug!(?node, "Change event for unregistered DRM device");
+                }
+                Err(err) => {
+                    warn!(?device_id, ?err, "Unable to identify changed DRM device");
+                }
+            },
+            UdevEvent::Removed { device_id } => match DrmNode::from_dev_id(device_id) {
+                Ok(node) => remove_drm_device(node, &session_for_udev, &handle, &mut devices),
+                Err(err) => {
+                    warn!(?device_id, ?err, "Unable to identify removed DRM device");
+                }
+            },
+        },
+    )?;
+
+    Ok(NativeSession { _session: session })
+}

@@ -1,35 +1,202 @@
-use super::{font::FontRenderer, primitives::Canvas, theme};
+use std::time::{Duration, Instant};
+
+use super::{font::FontRenderer, primitives::Canvas, theme::Theme};
+use vanta_apps::Application;
 use vanta_ipc::MinimizedWindowInfo;
 
 const ICON_SIZE: f32 = 44.0;
-const ICON_GAP: f32 = 8.0;
-const DOCK_PADDING: f32 = 10.0;
+const ICON_GAP: f32 = 6.0;
+const DOCK_PADDING: f32 = 8.0;
 const ICON_COUNT: u32 = 5;
 
 const APP_DOCK_X: f32 = 14.0;
 const APP_DOCK_Y: f32 = 8.0;
-const APP_DOCK_RADIUS: f32 = 21.0;
+const APP_DOCK_RADIUS: f32 = 18.0;
 
-const CARD_HEIGHT: f32 = 48.0;
-const CARD_MIN_WIDTH: f32 = 132.0;
-const CARD_MAX_WIDTH: f32 = 220.0;
+const CARD_HEIGHT: f32 = 40.0;
+const CARD_MIN_WIDTH: f32 = 116.0;
+const CARD_MAX_WIDTH: f32 = 200.0;
 const CARD_GAP: f32 = 8.0;
 const RIGHT_MARGIN: f32 = 14.0;
 
-pub const SURFACE_WIDTH: u32 = (ICON_COUNT as f32 * ICON_SIZE
-    + (ICON_COUNT - 1) as f32 * ICON_GAP
-    + 2.0 * DOCK_PADDING) as u32;
+/// Cached static dock artwork. Rebuilt only when its theme colors change.
+pub struct IconCache {
+    text_color: u32,
+    muted_color: u32,
+    icons: [Vec<u8>; ICON_COUNT as usize],
+}
 
-fn app_dock_width() -> f32 {
-    ICON_COUNT as f32 * ICON_SIZE + (ICON_COUNT - 1) as f32 * ICON_GAP + 2.0 * DOCK_PADDING
+impl IconCache {
+    pub fn new(colors: &Theme) -> Self {
+        let icons = std::array::from_fn(|index| {
+            let mut pixels = vec![0u8; ICON_SIZE as usize * ICON_SIZE as usize * 4];
+
+            {
+                let mut canvas = Canvas::new(&mut pixels, ICON_SIZE as u32, ICON_SIZE as u32);
+
+                draw_icon(&mut canvas, index as u32, 0.0, 0.0, colors);
+            }
+
+            pixels
+        });
+
+        Self {
+            text_color: colors.text,
+            muted_color: colors.text_muted,
+            icons,
+        }
+    }
+
+    fn refresh_if_needed(&mut self, colors: &Theme) {
+        if self.text_color != colors.text || self.muted_color != colors.text_muted {
+            *self = Self::new(colors);
+        }
+    }
+}
+
+/// Cached shadow and glass artwork for the application dock.
+pub struct DockBackgroundCache {
+    width: u32,
+    height: u32,
+    dock_width_bits: u32,
+    dock_height_bits: u32,
+    dock_color: u32,
+    edge_color: u32,
+    pixels: Vec<u8>,
+}
+
+impl DockBackgroundCache {
+    pub fn new(dock_width: f32, dock_height: f32, colors: &Theme) -> Self {
+        let origin_x = (APP_DOCK_X - 2.0).floor() as u32;
+        let origin_y = APP_DOCK_Y.floor() as u32;
+
+        let right = APP_DOCK_X + dock_width + 2.0;
+        let bottom = APP_DOCK_Y + dock_height + 6.0;
+
+        let width = (right.ceil() as u32).saturating_sub(origin_x);
+        let height = (bottom.ceil() as u32).saturating_sub(origin_y);
+
+        let mut pixels = vec![0u8; width as usize * height as usize * 4];
+
+        {
+            let mut canvas = Canvas::new(&mut pixels, width, height);
+            canvas.clear(0);
+
+            canvas.rounded_rect_f(
+                APP_DOCK_X - 2.0 - origin_x as f32,
+                APP_DOCK_Y + 3.0 - origin_y as f32,
+                dock_width + 4.0,
+                dock_height + 3.0,
+                APP_DOCK_RADIUS + 2.0,
+                0x18000000,
+            );
+
+            canvas.rounded_rect_f(
+                APP_DOCK_X - origin_x as f32,
+                APP_DOCK_Y - origin_y as f32,
+                dock_width,
+                dock_height,
+                APP_DOCK_RADIUS,
+                colors.dock,
+            );
+
+            canvas.rounded_rect_f(
+                APP_DOCK_X + 0.75 - origin_x as f32,
+                APP_DOCK_Y + 0.75 - origin_y as f32,
+                dock_width - 1.5,
+                dock_height - 1.5,
+                APP_DOCK_RADIUS - 0.75,
+                colors.glass_edge,
+            );
+        }
+
+        Self {
+            width,
+            height,
+            dock_width_bits: dock_width.to_bits(),
+            dock_height_bits: dock_height.to_bits(),
+            dock_color: colors.dock,
+            edge_color: colors.glass_edge,
+            pixels,
+        }
+    }
+
+    fn refresh_if_needed(&mut self, dock_width: f32, dock_height: f32, colors: &Theme) {
+        if self.dock_width_bits != dock_width.to_bits()
+            || self.dock_height_bits != dock_height.to_bits()
+            || self.dock_color != colors.dock
+            || self.edge_color != colors.glass_edge
+        {
+            *self = Self::new(dock_width, dock_height, colors);
+        }
+    }
+}
+
+fn visible_application_count(applications: &[Application], width: u32) -> usize {
+    let available_width = width as f32 * 0.70 - APP_DOCK_X;
+    let total_slots = ((available_width - 2.0 * DOCK_PADDING + ICON_GAP) / (ICON_SIZE + ICON_GAP))
+        .floor()
+        .max(1.0) as usize;
+
+    applications
+        .iter()
+        .filter(|app| is_dock_application(app))
+        .count()
+        .min(total_slots.saturating_sub(1))
+}
+
+fn app_dock_width(applications: &[Application], width: u32) -> f32 {
+    let slots = visible_application_count(applications, width) + 1;
+    slots as f32 * (ICON_SIZE + ICON_GAP) - ICON_GAP + 2.0 * DOCK_PADDING
+}
+
+pub fn is_dock_application(application: &Application) -> bool {
+    !application.terminal
+        && !application
+            .categories
+            .iter()
+            .any(|category| category.eq_ignore_ascii_case("ConsoleOnly"))
+        && (application.exec.is_some() || application.dbus_activatable)
+}
+
+fn icon_slot_x(index: usize) -> f32 {
+    APP_DOCK_X + DOCK_PADDING + index as f32 * (ICON_SIZE + ICON_GAP)
+}
+
+pub fn dock_application_at(
+    x: f64,
+    y: f64,
+    applications: &[Application],
+    width: u32,
+) -> Option<usize> {
+    let icon_y = APP_DOCK_Y + (super::theme::DOCK_HEIGHT as f32 - ICON_SIZE) * 0.5;
+
+    (0..visible_application_count(applications, width)).find(|&index| {
+        let icon_x = icon_slot_x(index);
+        x >= icon_x as f64
+            && x < (icon_x + ICON_SIZE) as f64
+            && y >= icon_y as f64
+            && y < (icon_y + ICON_SIZE) as f64
+    })
+}
+
+pub fn application_grid_icon_at(x: f64, y: f64, applications: &[Application], width: u32) -> bool {
+    let icon_x = icon_slot_x(visible_application_count(applications, width));
+    let icon_y = APP_DOCK_Y + (super::theme::DOCK_HEIGHT as f32 - ICON_SIZE) * 0.5;
+
+    x >= icon_x as f64
+        && x < (icon_x + ICON_SIZE) as f64
+        && y >= icon_y as f64
+        && y < (icon_y + ICON_SIZE) as f64
 }
 
 fn card_layout(
     width: u32,
     height: u32,
     windows: &[MinimizedWindowInfo],
+    applications: &[Application],
 ) -> (usize, usize, f32, f32, f32) {
-    let start_x = APP_DOCK_X + app_dock_width() + 12.0;
+    let start_x = APP_DOCK_X + app_dock_width(applications, width) + 12.0;
     let available = (width as f32 - start_x - RIGHT_MARGIN).max(0.0);
 
     let capacity = ((available + CARD_GAP) / (CARD_MIN_WIDTH + CARD_GAP))
@@ -56,10 +223,12 @@ pub fn minimized_window_at(
     width: u32,
     height: u32,
     windows: &[MinimizedWindowInfo],
+    applications: &[Application],
     x: f64,
     y: f64,
 ) -> Option<u64> {
-    let (first, visible, start_x, card_y, card_width) = card_layout(width, height, windows);
+    let (first, visible, start_x, card_y, card_width) =
+        card_layout(width, height, windows, applications);
 
     if visible == 0 {
         return None;
@@ -81,7 +250,14 @@ pub fn minimized_window_at(
 }
 
 /// Workspace indicators remain below the app dock, not below the minimized cards.
-pub fn workspace_at(width: u32, height: u32, workspace_count: u32, x: f64, y: f64) -> Option<u32> {
+pub fn workspace_at(
+    width: u32,
+    height: u32,
+    workspace_count: u32,
+    applications: &[Application],
+    x: f64,
+    y: f64,
+) -> Option<u32> {
     const DOT_SIZE: f32 = 4.0;
     const DOT_GAP: f32 = 5.0;
     const MAX_VISIBLE: u32 = 15;
@@ -96,7 +272,7 @@ pub fn workspace_at(width: u32, height: u32, workspace_count: u32, x: f64, y: f6
     }
 
     let total_width = count as f32 * DOT_SIZE + (count - 1) as f32 * DOT_GAP;
-    let start_x = APP_DOCK_X + (app_dock_width() - total_width) * 0.5;
+    let start_x = APP_DOCK_X + (app_dock_width(applications, width) - total_width) * 0.5;
     let relative_x = x - start_x as f64;
 
     if relative_x < 0.0 || relative_x >= total_width as f64 {
@@ -115,49 +291,80 @@ pub fn draw(
     workspace_count: u32,
     active_workspace: u32,
     minimized_windows: &[MinimizedWindowInfo],
-) {
-    if width < 320 || height < theme::DOCK_HEIGHT + 8 {
-        return;
+    applications: &[Application],
+    colors: &Theme,
+    icon_cache: &mut Option<IconCache>,
+    background_cache: &mut Option<DockBackgroundCache>,
+    measure: bool,
+) -> [Duration; 5] {
+    // Timings: cache construction, glass blit, icons, workspaces, minimized cards.
+    let mut timings = [Duration::ZERO; 5];
+
+    if width < 320 || height < super::theme::DOCK_HEIGHT + 8 {
+        return timings;
     }
 
-    let dock_width = app_dock_width().min(width as f32 * 0.70);
-    let dock_height = theme::DOCK_HEIGHT as f32;
+    let dock_width = app_dock_width(applications, width);
+    let dock_height = super::theme::DOCK_HEIGHT as f32;
     let dock_y = APP_DOCK_Y;
 
-    // App dock: left side of the shared bottom strip.
-    if dock_width >= app_dock_width() {
-        canvas.rounded_rect_f(
-            APP_DOCK_X - 2.0,
-            dock_y + 3.0,
-            dock_width + 4.0,
-            dock_height + 3.0,
-            APP_DOCK_RADIUS + 2.0,
-            0x18000000,
+    // App dock glass background. Separate cache work from recurring compositing.
+    if APP_DOCK_X + dock_width <= width as f32 * 0.70 {
+        let cache_started = measure.then(Instant::now);
+
+        let cache = background_cache
+            .get_or_insert_with(|| DockBackgroundCache::new(dock_width, dock_height, colors));
+        cache.refresh_if_needed(dock_width, dock_height, colors);
+
+        if let Some(started) = cache_started {
+            timings[0] = started.elapsed();
+        }
+
+        let blit_started = measure.then(Instant::now);
+
+        canvas.blit_premultiplied(
+            &cache.pixels,
+            cache.width,
+            cache.height,
+            (APP_DOCK_X - 2.0).floor() as u32,
+            APP_DOCK_Y.floor() as u32,
         );
 
-        canvas.rounded_rect_f(
-            APP_DOCK_X,
-            dock_y,
-            dock_width,
-            dock_height,
-            APP_DOCK_RADIUS,
-            0xE51A2030,
-        );
+        if let Some(started) = blit_started {
+            timings[1] = started.elapsed();
+        }
+    }
 
-        canvas.rounded_rect_f(
-            APP_DOCK_X + 0.75,
-            dock_y + 0.75,
-            dock_width - 1.5,
-            dock_height - 1.5,
-            APP_DOCK_RADIUS - 0.75,
-            0x557D91B5,
-        );
+    let mut stage_started = measure.then(Instant::now);
 
-        for index in 0..ICON_COUNT {
-            let x = APP_DOCK_X + DOCK_PADDING + index as f32 * (ICON_SIZE + ICON_GAP);
-            let y = dock_y + (dock_height - ICON_SIZE) * 0.5;
+    // Render only real installed applications in the application slots.
+    if APP_DOCK_X + dock_width <= width as f32 * 0.70 {
+        let cache = icon_cache.get_or_insert_with(|| IconCache::new(colors));
+        cache.refresh_if_needed(colors);
 
-            draw_icon(canvas, index, x, y);
+        let visible_count = visible_application_count(applications, width);
+        let y = dock_y + (dock_height - ICON_SIZE) * 0.5;
+
+        for (index, application) in applications
+            .iter()
+            .filter(|application| is_dock_application(application))
+            .take(visible_count)
+            .enumerate()
+        {
+            let x = icon_slot_x(index);
+
+            if let Some(icon) = super::icon_cache::get_icon(application.icon.as_deref()) {
+                let icon_x = x + (ICON_SIZE - icon.size as f32) * 0.5;
+                let icon_y = y + (ICON_SIZE - icon.size as f32) * 0.5;
+
+                canvas.blit_premultiplied(
+                    icon.pixels.as_ref(),
+                    icon.size,
+                    icon.size,
+                    icon_x.max(0.0) as u32,
+                    icon_y.max(0.0) as u32,
+                );
+            }
 
             if index == 0 {
                 canvas.rounded_rect_f(
@@ -166,37 +373,66 @@ pub fn draw(
                     6.0,
                     2.5,
                     1.25,
-                    theme::COLOR_ACCENT,
+                    colors.accent,
                 );
             }
         }
 
-        draw_workspaces(canvas, height, workspace_count, active_workspace);
+        // Dedicated application-grid launcher, after the executable apps.
+        let grid_x = icon_slot_x(visible_count);
+        canvas.blit_premultiplied(
+            &cache.icons[(ICON_COUNT - 1) as usize],
+            ICON_SIZE as u32,
+            ICON_SIZE as u32,
+            grid_x as u32,
+            y as u32,
+        );
+    }
+
+    if let Some(started) = stage_started {
+        timings[3] = started.elapsed();
+        stage_started = Some(Instant::now());
+    }
+
+    if APP_DOCK_X + dock_width <= width as f32 * 0.70 {
+        draw_workspaces(
+            canvas,
+            height,
+            workspace_count,
+            active_workspace,
+            applications,
+            width,
+            colors,
+        );
+    }
+
+    if let Some(started) = stage_started {
+        timings[2] = started.elapsed();
+        stage_started = Some(Instant::now());
     }
 
     // Minimized windows: right side, vertically aligned with the app dock.
     let (first, visible, start_x, card_y, card_width) =
-        card_layout(width, height, minimized_windows);
+        card_layout(width, height, minimized_windows, applications);
 
     for offset in 0..visible {
         let window = &minimized_windows[first + offset];
         let x = start_x + offset as f32 * (card_width + CARD_GAP);
 
-        canvas.rounded_rect_f(x, card_y + 2.0, card_width, CARD_HEIGHT, 15.0, 0x18000000);
+        canvas.rounded_rect_f(x, card_y + 2.0, card_width, CARD_HEIGHT, 13.0, 0x18000000);
 
-        canvas.rounded_rect_f(x, card_y, card_width, CARD_HEIGHT, 15.0, 0xE51A2030);
+        canvas.rounded_rect_f(x, card_y, card_width, CARD_HEIGHT, 13.0, colors.dock);
 
         canvas.rounded_rect_f(
             x + 0.75,
             card_y + 0.75,
             card_width - 1.5,
             CARD_HEIGHT - 1.5,
-            14.25,
-            0x557D91B5,
+            12.25,
+            colors.glass_edge,
         );
 
-        // Small application marker.
-        canvas.rounded_rect_f(x + 10.0, card_y + 17.0, 5.0, 14.0, 2.5, theme::COLOR_ACCENT);
+        canvas.rounded_rect_f(x + 10.0, card_y + 14.0, 5.0, 12.0, 2.5, colors.accent);
 
         let title = window
             .title
@@ -208,15 +444,14 @@ pub fn draw(
         let available_text_width = card_width - 36.0;
         let title = fit_title(font, title, available_text_width, 13.0);
 
-        font.draw_text(
-            canvas,
-            x + 23.0,
-            card_y + 29.0,
-            &title,
-            theme::COLOR_TEXT,
-            13.0,
-        );
+        font.draw_text(canvas, x + 23.0, card_y + 25.0, &title, colors.text, 13.0);
     }
+
+    if let Some(started) = stage_started {
+        timings[4] = started.elapsed();
+    }
+
+    timings
 }
 
 fn fit_title(font: &FontRenderer, title: &str, max_width: f32, size: f32) -> String {
@@ -247,6 +482,9 @@ fn draw_workspaces(
     height: u32,
     workspace_count: u32,
     active_workspace: u32,
+    applications: &[Application],
+    width: u32,
+    colors: &Theme,
 ) {
     const DOT_SIZE: f32 = 4.0;
     const DOT_GAP: f32 = 5.0;
@@ -254,25 +492,25 @@ fn draw_workspaces(
 
     let count = workspace_count.clamp(1, MAX_VISIBLE);
     let total_width = count as f32 * DOT_SIZE + (count - 1) as f32 * DOT_GAP;
-    let start_x = APP_DOCK_X + (app_dock_width() - total_width) * 0.5;
+    let start_x = APP_DOCK_X + (app_dock_width(applications, width) - total_width) * 0.5;
     let y = height as f32 - 6.0;
 
     for index in 0..count {
         let x = start_x + index as f32 * (DOT_SIZE + DOT_GAP);
         let color = if index == active_workspace {
-            theme::COLOR_ACCENT
+            colors.accent
         } else {
-            theme::COLOR_TEXT_MUTED
+            colors.text_muted
         };
 
         canvas.rounded_rect_f(x, y, DOT_SIZE, DOT_SIZE, 2.0, color);
     }
 }
 
-fn draw_icon(canvas: &mut Canvas<'_>, index: u32, x: f32, y: f32) {
-    let white = theme::COLOR_TEXT;
+fn draw_icon(canvas: &mut Canvas<'_>, index: u32, x: f32, y: f32, colors: &Theme) {
+    let white = colors.text;
     let dark = 0xFF263247;
-    let muted = theme::COLOR_TEXT_MUTED;
+    let muted = colors.text_muted;
 
     let backgrounds = [0xFF354B70, 0xFF315D78, 0xFF53617A, 0xFF65567F, 0xFF3E6870];
 

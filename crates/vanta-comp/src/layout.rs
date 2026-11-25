@@ -1,7 +1,12 @@
+use crate::{
+    layout_engine::{MinSize, Rect},
+    state::WindowTransition,
+};
 use smithay::{
     desktop::Window,
     utils::{IsAlive, Logical, Point, Rectangle, Size},
 };
+use std::collections::HashSet;
 
 use crate::Vanta;
 
@@ -207,11 +212,22 @@ impl Vanta {
             .retain(|id, _| self.windows.contains_key(id));
     }
 
-    /// Recalculate the single-output master-and-stack layout.
+    /// Recalculate the active workspace's adaptive split-tree layout.
     ///
-    /// Client sizes are requested through XDG configure events. Vanta does not
-    /// assume that a client has accepted or committed a requested size.
+    /// The workspace tree is persistent: relayout changes geometry without
+    /// rebuilding window topology. Client sizes are requested through XDG
+    /// configure events and are not assumed to have been accepted.
+    /// Recalculate the active workspace using its selected layout strategy.
+    ///
+    /// Adaptive mode uses a temporary projection of the persistent split tree
+    /// so floating and minimized windows retain their original tree positions.
+    /// MasterStack calculates geometry independently without changing topology.
+    /// Floating mode leaves all window geometry under direct user control.
     pub fn relayout_windows(&mut self) {
+        if self.layout_mode == vanta_ipc::LayoutMode::Floating {
+            return;
+        }
+
         let Some(output) = self.output.clone() else {
             return;
         };
@@ -225,8 +241,13 @@ impl Vanta {
             .iter()
             .filter_map(|(&id, window)| {
                 if self.floating_windows.contains(&id)
+                    || self
+                        .transitions
+                        .get(&id)
+                        .is_some_and(WindowTransition::is_minimizing)
                     || !window.alive()
                     || !self.space.elements().any(|mapped| mapped == window)
+                    || self.window_workspaces.get(&id) != Some(&self.active_workspace)
                 {
                     return None;
                 }
@@ -241,14 +262,135 @@ impl Vanta {
             return;
         }
 
-        let window_ids: Vec<u64> = tiled.iter().map(|(id, _)| *id).collect();
-        let targets = calculate_layout(&window_ids, area.loc, area.size);
+        let margin = if area.size.w >= 48 && area.size.h >= 48 {
+            12
+        } else {
+            0
+        };
 
-        for ((id, window), (location, requested_size)) in tiled.into_iter().zip(targets.into_iter())
-        {
+        let bounds = Rect::new(
+            area.loc.x.saturating_add(margin),
+            area.loc.y.saturating_add(margin),
+            area.size.w.saturating_sub(margin.saturating_mul(2)),
+            area.size.h.saturating_sub(margin.saturating_mul(2)),
+        );
+
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+
+        let focused_window = self.seat.get_keyboard().and_then(|keyboard| {
+            let focused_surface = keyboard.current_focus()?;
+
+            self.windows.iter().find_map(|(&id, window)| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &focused_surface)
+                    .then_some(id)
+            })
+        });
+
+        // Normalize both layout engines into (window ID, rectangle) pairs.
+        let placements: Vec<(u64, Rect)> = match self.layout_mode {
+            vanta_ipc::LayoutMode::Floating => Vec::new(),
+
+            vanta_ipc::LayoutMode::MasterStack => {
+                let origin: LayoutPosition = (bounds.x, bounds.y).into();
+                let size: LayoutSize = (bounds.width, bounds.height).into();
+
+                calculate_layout(
+                    &tiled.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    origin,
+                    size,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(index, (location, size))| {
+                    (
+                        tiled[index].0,
+                        Rect::new(location.x, location.y, size.w, size.h),
+                    )
+                })
+                .collect()
+            }
+
+            vanta_ipc::LayoutMode::Adaptive => {
+                let tree = self
+                    .workspace_layouts
+                    .entry(self.active_workspace)
+                    .or_default();
+
+                // Add new windows to the persistent topology. Existing nodes
+                // and split ratios are retained across ordinary relayouts.
+                for (id, _) in &tiled {
+                    if !tree.contains(*id) {
+                        if let Err(error) = tree.insert(*id, focused_window, bounds, gap, min_size)
+                        {
+                            tracing::warn!(
+                                window_id = *id,
+                                ?error,
+                                "Unable to insert window into adaptive layout"
+                            );
+                        }
+                    }
+                }
+
+                // Project only currently tiled windows. Do not remove floating
+                // or minimized windows from the persistent workspace tree.
+                let mut projection = tree.clone();
+                let tiled_ids: HashSet<u64> = tiled.iter().map(|(id, _)| *id).collect();
+
+                let excluded_ids: Vec<u64> = self
+                    .windows
+                    .keys()
+                    .copied()
+                    .filter(|id| {
+                        self.window_workspaces.get(id) == Some(&self.active_workspace)
+                            && !tiled_ids.contains(id)
+                    })
+                    .collect();
+
+                for id in excluded_ids {
+                    projection.remove(id);
+                }
+
+                match projection.layout(bounds, gap, min_size) {
+                    Ok(items) => items
+                        .into_iter()
+                        .map(|item| (item.window_id, item.rect))
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace = self.active_workspace,
+                            ?error,
+                            "Unable to calculate adaptive workspace layout"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
+
+        for (id, rect) in placements {
+            let Some(window) = self.windows.get(&id).cloned() else {
+                continue;
+            };
+
+            // Ignore stale or excluded projection entries.
+            if !tiled.iter().any(|(tiled_id, _)| *tiled_id == id) {
+                continue;
+            }
+
+            let location: LayoutPosition = (rect.x, rect.y).into();
+            let requested_size: LayoutSize = (rect.width, rect.height).into();
+
+            self.motion
+                .animate_window(id, f64::from(location.x), f64::from(location.y), 1.0, 1.0);
+
             if self.space.element_location(&window) != Some(location) {
                 self.space.relocate_element(&window, location);
             }
+
+            self.window_locations.insert(id, location);
 
             if self.layout_sizes.get(&id) == Some(&requested_size) {
                 continue;

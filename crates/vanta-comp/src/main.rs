@@ -7,6 +7,9 @@ mod grabs;
 mod input;
 mod ipc;
 mod layout;
+mod layout_engine;
+mod motion;
+mod motion_render;
 mod native;
 mod scene;
 mod state;
@@ -25,7 +28,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let display: Display<Vanta> = Display::new()?;
 
+    let startup_started = std::time::Instant::now();
     let mut state = Vanta::new(&mut event_loop, display);
+    let compositor_init_ms = startup_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("VANTA_TIMING compositor_init_ms={compositor_init_ms:.3}");
+    tracing::info!(compositor_init_ms, "Vanta compositor initialized");
+
+    let backend_started = std::time::Instant::now();
 
     // Start the local control socket before entering the compositor loop.
     let _ipc_server = ipc::start(&mut event_loop)?;
@@ -44,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Start it once; it can receive output configuration after hotplug.
             unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
             spawn_shell();
+            spawn_spatial(&state.socket_name);
 
             Some(session)
         }
@@ -54,7 +64,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches!(backend, backend::BackendKind::Winit) {
         unsafe { std::env::set_var("WAYLAND_DISPLAY", &state.socket_name) };
         spawn_shell();
+        spawn_spatial(&state.socket_name);
     }
+
+    let backend_setup_ms = backend_started.elapsed().as_secs_f64() * 1000.0;
+    tracing::info!(backend_setup_ms, "Vanta backend and shell setup completed");
 
     event_loop.run(None, &mut state, move |_| {
         // Vanta is running
@@ -95,6 +109,50 @@ fn spawn_shell() {
         }
         Err(error) => {
             eprintln!("vanta-comp: failed to start vanta-shell: {error}");
+        }
+    }
+}
+
+fn spawn_spatial(wayland_display: &std::ffi::OsStr) {
+    if std::env::var("VANTA_SPATIAL").as_deref() != Ok("1") {
+        return;
+    }
+
+    let Some(project) = std::env::var_os("VANTA_SPATIAL_PROJECT") else {
+        eprintln!("vanta-comp: VANTA_SPATIAL_PROJECT is required when spatial mode is enabled");
+        return;
+    };
+
+    let project_path = std::path::PathBuf::from(project);
+    if !project_path.join("project.godot").is_file() {
+        eprintln!(
+            "vanta-comp: Godot project not found at {}",
+            project_path.display()
+        );
+        return;
+    }
+
+    let godot_bin =
+        std::env::var_os("VANTA_GODOT_BIN").unwrap_or_else(|| std::ffi::OsString::from("godot"));
+
+    match std::process::Command::new(&godot_bin)
+        .arg("--display-driver")
+        .arg("wayland")
+        .arg("--rendering-method")
+        .arg("gl_compatibility")
+        .arg("--rendering-driver")
+        .arg("opengl3")
+        .arg("--path")
+        .arg(&project_path)
+        .env("WAYLAND_DISPLAY", wayland_display)
+        .env_remove("DISPLAY")
+        .spawn()
+    {
+        Ok(child) => {
+            eprintln!("vanta-comp: started Vanta Spatial (pid {})", child.id());
+        }
+        Err(error) => {
+            eprintln!("vanta-comp: failed to start Vanta Spatial: {error}");
         }
     }
 }

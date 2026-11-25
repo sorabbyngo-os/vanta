@@ -9,15 +9,14 @@ vanta-ipc = { path = "../vanta-ipc" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 bitflags = "2"
-png = "0.18.1"
 
 [dependencies.smithay]
-git = "https://github.com/Smithay/smithay.git"
-rev = "6b37edc019889148608a73e3e27423979cd642c8"
+path = "../../../smithay"
 default-features = false
 features = [
     "backend_winit",
     "backend_session_libseat",
+    "backend_libinput",
     "backend_udev",
     "backend_drm",
     "backend_gbm",
@@ -25,3 +24,6 @@ features = [
     "desktop",
     "renderer_gl",
 ]
+
+[build-dependencies]
+png = "0.18.1"

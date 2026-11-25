@@ -1,0 +1,111 @@
+[gd_scene load_steps=14 format=3]
+
+[ext_resource type="Script" path="res://scripts/desktop/spatial_grid.gd" id="1_grid"]
+[ext_resource type="Script" path="res://scripts/camera/spatial_camera.gd" id="2_camera"]
+[ext_resource type="Script" path="res://scripts/input/spatial_pointer.gd" id="3_pointer"]
+[ext_resource type="Script" path="res://scripts/window/spatial_window_manager.gd" id="4_window_manager"]
+
+[sub_resource type="Environment" id="Environment_main"]
+background_mode = 1
+background_color = Color(0.012, 0.02, 0.04, 1)
+ambient_light_source = 3
+ambient_light_color = Color(0.55, 0.65, 0.85, 1)
+ambient_light_energy = 0.6
+
+[sub_resource type="BoxMesh" id="BoxMesh_panel"]
+size = Vector3(3.2, 1.8, 0.06)
+
+[sub_resource type="BoxShape3D" id="Panel_collision"]
+size = Vector3(3.2, 1.8, 0.06)
+
+[sub_resource type="StandardMaterial3D" id="Material_panel"]
+albedo_color = Color(0.12, 0.18, 0.28, 0.82)
+transparency = 1
+metallic = 0.25
+roughness = 0.22
+
+[sub_resource type="PlaneMesh" id="Floor_mesh"]
+size = Vector2(18, 18)
+
+[sub_resource type="StandardMaterial3D" id="Floor_material"]
+albedo_color = Color(0.025, 0.04, 0.065, 1)
+metallic = 0.18
+roughness = 0.32
+
+[sub_resource type="BoxMesh" id="Panel_secondary_mesh"]
+size = Vector3(1.8, 1.1, 0.05)
+
+[sub_resource type="BoxShape3D" id="Panel_secondary_collision"]
+size = Vector3(1.8, 1.1, 0.05)
+
+[sub_resource type="StandardMaterial3D" id="Panel_secondary_material"]
+albedo_color = Color(0.08, 0.22, 0.34, 0.78)
+transparency = 1
+metallic = 0.3
+roughness = 0.2
+
+
+[node name="VantaSpatial" type="Node3D"]
+
+[node name="WorldEnvironment" type="WorldEnvironment" parent="."]
+environment = SubResource("Environment_main")
+
+[node name="Camera3D" type="Camera3D" parent="."]
+position = Vector3(0, 2.4, 8)
+rotation = Vector3(-0.22, 0, 0)
+fov = 75.0
+current = true
+script = ExtResource("2_camera")
+
+[node name="DirectionalLight3D" type="DirectionalLight3D" parent="."]
+rotation = Vector3(-0.7, 0.4, 0)
+light_energy = 1.2
+
+[node name="DesktopPanel" type="Node3D" parent="."]
+groups = ["spatial_window"]
+
+[node name="HitTarget" type="StaticBody3D" parent="DesktopPanel"]
+collision_layer = 1
+collision_mask = 0
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="DesktopPanel/HitTarget"]
+shape = SubResource("Panel_collision")
+
+[node name="Visual" type="MeshInstance3D" parent="DesktopPanel"]
+mesh = SubResource("BoxMesh_panel")
+surface_material_override/0 = SubResource("Material_panel")
+
+
+[node name="Floor" type="MeshInstance3D" parent="."]
+mesh = SubResource("Floor_mesh")
+material_override = SubResource("Floor_material")
+position = Vector3(0, -2.2, -2)
+rotation = Vector3(-1.5708, 0, 0)
+
+[node name="SecondaryPanel" type="Node3D" parent="."]
+position = Vector3(2.5, 0.2, -1.5)
+rotation = Vector3(0, -0.22, 0)
+groups = ["spatial_window"]
+
+[node name="HitTarget" type="StaticBody3D" parent="SecondaryPanel"]
+collision_layer = 1
+collision_mask = 0
+
+[node name="CollisionShape3D" type="CollisionShape3D" parent="SecondaryPanel/HitTarget"]
+shape = SubResource("Panel_secondary_collision")
+
+[node name="Visual" type="MeshInstance3D" parent="SecondaryPanel"]
+mesh = SubResource("Panel_secondary_mesh")
+material_override = SubResource("Panel_secondary_material")
+
+[node name="SpatialGrid" type="Node3D" parent="."]
+position = Vector3(0, -2.18, -2)
+script = ExtResource("1_grid")
+
+[node name="SpatialWindowManager" type="Node" parent="."]
+script = ExtResource("4_window_manager")
+
+[node name="SpatialPointer" type="Node" parent="."]
+script = ExtResource("3_pointer")
+camera = NodePath("../Camera3D")
+window_manager = NodePath("../SpatialWindowManager")

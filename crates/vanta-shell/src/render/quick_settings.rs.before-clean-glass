@@ -1,0 +1,350 @@
+use std::process::Command;
+
+use super::{font::FontRenderer, primitives::Canvas, theme};
+
+const PANEL_BG: u32 = 0xE51A2638;
+const CARD_BG: u32 = 0x72566B88;
+const CARD_HIGHLIGHT: u32 = 0x35FFFFFF;
+const ACTIVE_BG: u32 = 0xAA426BA8;
+const MAX_VISIBLE_WORKSPACES: u32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControlAction {
+    Close,
+    SwitchWorkspace(u32),
+    CreateWorkspace,
+    ToggleWifi,
+    ToggleBluetooth,
+    ToggleMute,
+    VolumeDown,
+    VolumeUp,
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ControlState {
+    pub wifi_enabled: bool,
+    pub wifi_connected: bool,
+    pub bluetooth_powered: bool,
+    pub audio_muted: bool,
+    pub volume: f32,
+    pub brightness_percent: Option<u32>,
+}
+
+impl ControlState {
+    pub fn read() -> Self {
+        let wifi_enabled = command_text("nmcli", &["radio", "wifi"])
+            .is_some_and(|s| s.trim().eq_ignore_ascii_case("enabled"));
+
+        let wifi_connected = command_text(
+            "nmcli",
+            &["-t", "-f", "TYPE,STATE", "device", "status"],
+        )
+        .is_some_and(|s| {
+            s.lines().any(|line| {
+                line.starts_with("wifi:") && line.to_ascii_lowercase().contains("connected")
+            })
+        });
+
+        let bluetooth_powered = command_text("bluetoothctl", &["show"])
+            .is_some_and(|s| s.lines().any(|line| line.trim() == "Powered: yes"));
+
+        let audio = command_text("wpctl", &["get-volume", "@DEFAULT_AUDIO_SINK@"]);
+        let audio_muted = audio.as_deref().is_some_and(|s| s.contains("[MUTED]"));
+        let volume = audio
+            .as_deref()
+            .and_then(|s| s.split_whitespace().find_map(|part| part.parse::<f32>().ok()))
+            .unwrap_or(0.0)
+            .clamp(0.0, 1.0);
+
+        Self {
+            wifi_enabled,
+            wifi_connected,
+            bluetooth_powered,
+            audio_muted,
+            volume,
+            brightness_percent: read_brightness(),
+        }
+    }
+
+    pub fn refresh(&mut self) -> bool {
+        let next = Self::read();
+        let changed = *self != next;
+        *self = next;
+        changed
+    }
+
+    pub fn perform(&mut self, action: ControlAction) {
+        let result = match action {
+            ControlAction::ToggleWifi => {
+                let target = if self.wifi_enabled { "off" } else { "on" };
+                run_command("nmcli", &["radio", "wifi", target])
+            }
+            ControlAction::ToggleBluetooth => {
+                let target = if self.bluetooth_powered { "off" } else { "on" };
+                run_command("bluetoothctl", &["power", target])
+            }
+            ControlAction::ToggleMute => {
+                run_command("wpctl", &["set-mute", "@DEFAULT_AUDIO_SINK@", "toggle"])
+            }
+            ControlAction::VolumeDown | ControlAction::VolumeUp => {
+                let delta = if action == ControlAction::VolumeUp { 0.05 } else { -0.05 };
+                let target = (self.volume + delta).clamp(0.0, 1.0);
+                let value = format!("{target:.2}");
+                run_command("wpctl", &["set-volume", "@DEFAULT_AUDIO_SINK@", &value])
+            }
+            _ => return,
+        };
+
+        if let Err(error) = result {
+            eprintln!("vanta-shell: control action failed: {error}");
+        }
+        self.refresh();
+    }
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let output = Command::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|error| format!("{program}: {error}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{program} exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn read_brightness() -> Option<u32> {
+    let current = std::fs::read_to_string(
+        "/sys/class/backlight/intel_backlight/brightness",
+    )
+    .ok()?
+    .trim()
+    .parse::<u64>()
+    .ok()?;
+
+    let maximum = std::fs::read_to_string(
+        "/sys/class/backlight/intel_backlight/max_brightness",
+    )
+    .ok()?
+    .trim()
+    .parse::<u64>()
+    .ok()?;
+
+    if maximum == 0 {
+        return None;
+    }
+
+    Some((current.saturating_mul(100) / maximum).min(100) as u32)
+}
+
+pub fn draw(
+    canvas: &mut Canvas<'_>,
+    font: &FontRenderer,
+    width: u32,
+    height: u32,
+    workspace_count: u32,
+    active_workspace: u32,
+    state: &ControlState,
+) {
+    if width < 100 || height < 100 {
+        return;
+    }
+
+    let w = width as f32;
+    canvas.rounded_rect_f(2.0, 2.0, w - 4.0, height as f32 - 4.0, 22.0, PANEL_BG);
+    canvas.rounded_rect_f(3.0, 3.0, w - 6.0, 1.0, 0.5, 0x48FFFFFF);
+
+    font.draw_text(canvas, 18.0, 32.0, "Controls", theme::COLOR_TEXT, 17.0);
+    font.draw_text(
+        canvas, 18.0, 53.0, "System settings and workspaces",
+        theme::COLOR_TEXT_MUTED, 10.0,
+    );
+
+    canvas.rounded_rect_f(w - 66.0, 13.0, 48.0, 27.0, 9.0, CARD_BG);
+    font.draw_text(canvas, w - 55.0, 31.0, "Close", theme::COLOR_TEXT, 10.0);
+
+    draw_tile(
+        canvas, font, 16.0, 78.0, 157.0, 48.0, "Wi-Fi",
+        if state.wifi_enabled {
+            if state.wifi_connected { "Connected" } else { "Enabled · not connected" }
+        } else {
+            "Off"
+        },
+        state.wifi_enabled,
+    );
+
+    draw_tile(
+        canvas, font, 187.0, 78.0, 157.0, 48.0, "Bluetooth",
+        if state.bluetooth_powered { "On" } else { "Off" },
+        state.bluetooth_powered,
+    );
+
+    canvas.rounded_rect_f(16.0, 136.0, 328.0, 48.0, 12.0, CARD_BG);
+    canvas.rounded_rect_f(17.0, 137.0, 326.0, 1.0, 0.5, CARD_HIGHLIGHT);
+    font.draw_text(canvas, 28.0, 155.0, "Sound", theme::COLOR_TEXT, 10.0);
+    font.draw_text(
+        canvas, 28.0, 172.0,
+        if state.audio_muted { "Muted" } else { "Output active" },
+        theme::COLOR_TEXT_MUTED, 8.0,
+    );
+
+    canvas.rounded_rect_f(160.0, 146.0, 58.0, 28.0, 8.0, ACTIVE_BG);
+    font.draw_text(
+        canvas, 169.0, 164.0,
+        if state.audio_muted { "Unmute" } else { "Mute" },
+        theme::COLOR_TEXT, 9.0,
+    );
+
+    canvas.rounded_rect_f(230.0, 146.0, 34.0, 28.0, 8.0, CARD_BG);
+    font.draw_text(canvas, 242.0, 165.0, "−", theme::COLOR_TEXT, 14.0);
+    canvas.rounded_rect_f(269.0, 146.0, 34.0, 28.0, 8.0, CARD_BG);
+    font.draw_text(canvas, 281.0, 165.0, "+", theme::COLOR_TEXT, 14.0);
+    font.draw_text(
+        canvas, 309.0, 164.0, &format!("{:.0}%", state.volume * 100.0),
+        theme::COLOR_TEXT_MUTED, 8.0,
+    );
+
+    canvas.rounded_rect_f(16.0, 194.0, 328.0, 40.0, 11.0, CARD_BG);
+    font.draw_text(canvas, 28.0, 218.0, "Display brightness", theme::COLOR_TEXT, 9.0);
+    let brightness = state.brightness_percent
+        .map(|value| format!("{value}%"))
+        .unwrap_or_else(|| "Unavailable".to_string());
+    font.draw_text(canvas, 292.0, 218.0, &brightness, theme::COLOR_TEXT_MUTED, 9.0);
+
+    canvas.horizontal_line(16, 246, width.saturating_sub(32), 0x337D91B5);
+    font.draw_text(canvas, 18.0, 268.0, "WORKSPACES", theme::COLOR_TEXT_MUTED, 9.0);
+
+    let visible_count = workspace_count.min(MAX_VISIBLE_WORKSPACES);
+    for index in 0..visible_count {
+        let column = index % 5;
+        let row = index / 5;
+        let x = 16.0 + column as f32 * 65.0;
+        let y = 282.0 + row as f32 * 42.0;
+        let active = index == active_workspace;
+
+        canvas.rounded_rect_f(
+            x, y, 57.0, 36.0, 10.0,
+            if active { ACTIVE_BG } else { CARD_BG },
+        );
+        canvas.rounded_rect_f(x + 1.0, y + 1.0, 55.0, 1.0, 0.5, CARD_HIGHLIGHT);
+
+        let label = format!("{}", index + 1);
+        let label_width = font.text_width(&label, 13.0);
+        font.draw_text(
+            canvas, x + (57.0 - label_width) * 0.5, y + 23.0,
+            &label, theme::COLOR_TEXT, 13.0,
+        );
+
+        if active {
+            canvas.rounded_rect_f(x + 23.0, y + 29.0, 11.0, 2.0, 1.0, 0xFFD9E8FF);
+        }
+    }
+
+    canvas.rounded_rect_f(16.0, 374.0, w - 32.0, 42.0, 12.0, CARD_BG);
+    canvas.rounded_rect_f(17.0, 375.0, w - 34.0, 1.0, 0.5, CARD_HIGHLIGHT);
+    font.draw_text(canvas, 29.0, 400.0, "+  Add workspace", theme::COLOR_TEXT, 12.0);
+
+    if workspace_count > MAX_VISIBLE_WORKSPACES {
+        font.draw_text(
+            canvas, 210.0, 268.0, &format!("{workspace_count} total"),
+            theme::COLOR_TEXT_MUTED, 8.0,
+        );
+    }
+}
+
+fn draw_tile(
+    canvas: &mut Canvas<'_>,
+    font: &FontRenderer,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    title: &str,
+    status: &str,
+    active: bool,
+) {
+    canvas.rounded_rect_f(
+        x, y, width, height, 12.0,
+        if active { ACTIVE_BG } else { CARD_BG },
+    );
+    canvas.rounded_rect_f(x + 1.0, y + 1.0, width - 2.0, 1.0, 0.5, CARD_HIGHLIGHT);
+    font.draw_text(canvas, x + 11.0, y + 20.0, title, theme::COLOR_TEXT, 10.0);
+    font.draw_text(canvas, x + 11.0, y + 36.0, status, theme::COLOR_TEXT_MUTED, 8.0);
+}
+
+pub fn hit_test(
+    width: u32,
+    _height: u32,
+    x: f64,
+    y: f64,
+    workspace_count: u32,
+) -> Option<ControlAction> {
+    if x >= width.saturating_sub(66) as f64
+        && x < width.saturating_sub(18) as f64
+        && (13.0..40.0).contains(&y)
+    {
+        return Some(ControlAction::Close);
+    }
+
+    if (16.0..173.0).contains(&x) && (78.0..126.0).contains(&y) {
+        return Some(ControlAction::ToggleWifi);
+    }
+
+    if (187.0..344.0).contains(&x) && (78.0..126.0).contains(&y) {
+        return Some(ControlAction::ToggleBluetooth);
+    }
+
+    if (16.0..344.0).contains(&x) && (136.0..184.0).contains(&y) {
+        if (150.0..222.0).contains(&x) {
+            return Some(ControlAction::ToggleMute);
+        }
+        if (230.0..264.0).contains(&x) {
+            return Some(ControlAction::VolumeDown);
+        }
+        if (269.0..303.0).contains(&x) {
+            return Some(ControlAction::VolumeUp);
+        }
+    }
+
+    if (16.0..(width as f64 - 16.0)).contains(&x)
+        && (282.0..366.0).contains(&y)
+    {
+        let column = ((x - 16.0) / 65.0) as u32;
+        let row = ((y - 282.0) / 42.0) as u32;
+        let local_x = (x - 16.0) - column as f64 * 65.0;
+        let local_y = (y - 282.0) - row as f64 * 42.0;
+        let index = row * 5 + column;
+
+        if column < 5
+            && row < 2
+            && local_x < 57.0
+            && local_y < 36.0
+            && index < workspace_count.min(MAX_VISIBLE_WORKSPACES)
+        {
+            return Some(ControlAction::SwitchWorkspace(index));
+        }
+    }
+
+    if x >= 16.0
+        && x < width.saturating_sub(16) as f64
+        && (374.0..416.0).contains(&y)
+    {
+        return Some(ControlAction::CreateWorkspace);
+    }
+
+    None
+}

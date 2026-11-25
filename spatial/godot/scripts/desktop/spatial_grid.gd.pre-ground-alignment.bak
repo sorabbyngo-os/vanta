@@ -1,0 +1,39 @@
+extends Node3D
+
+@export var grid_size: int = 20
+@export var spacing: float = 1.0
+@export var line_width: float = 0.012
+
+func _ready() -> void:
+	var material := StandardMaterial3D.new()
+	material.albedo_color = Color(0.12, 0.32, 0.48, 0.65)
+	material.emission_enabled = true
+	material.emission = Color(0.025, 0.12, 0.22)
+	material.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
+
+	for i in range(-grid_size, grid_size + 1):
+		_add_line(
+			Vector3(float(i) * spacing, 0.0, -grid_size * spacing),
+			Vector3(float(i) * spacing, 0.0, grid_size * spacing),
+			material
+		)
+		_add_line(
+			Vector3(-grid_size * spacing, 0.0, float(i) * spacing),
+			Vector3(grid_size * spacing, 0.0, float(i) * spacing),
+			material
+		)
+
+func _add_line(start: Vector3, finish: Vector3, material: Material) -> void:
+	var along_z := is_equal_approx(start.x, finish.x)
+	var mesh := BoxMesh.new()
+	mesh.size = Vector3(start.distance_to(finish), line_width, line_width)
+
+	var line := MeshInstance3D.new()
+	line.mesh = mesh
+	line.material_override = material
+	line.position = (start + finish) * 0.5
+
+	if along_z:
+		line.rotation.y = PI / 2.0
+
+	add_child(line)

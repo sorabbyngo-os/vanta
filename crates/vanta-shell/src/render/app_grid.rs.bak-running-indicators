@@ -1,0 +1,306 @@
+use crate::render::{font::FontRenderer, primitives::Canvas};
+use vanta_apps::Application;
+
+const PANEL_BG: u32 = 0xD91A2030;
+const PANEL_BORDER: u32 = 0x557D91B5;
+const SEARCH_BG: u32 = 0x99434F65;
+const CARD_BG: u32 = 0x66434F65;
+const CARD_SELECTED: u32 = 0x9978A9FF;
+const TEXT: u32 = 0xFFF2F5FC;
+const MUTED: u32 = 0xFF9AA8BD;
+const ACCENT: u32 = 0xFF78A9FF;
+
+const COLUMNS: usize = 4;
+const MAX_VISIBLE: usize = 16;
+const GAP: u32 = 12;
+const CARD_HEIGHT: u32 = 104;
+
+pub fn draw(
+    canvas: &mut Canvas<'_>,
+    font: &FontRenderer,
+    width: u32,
+    height: u32,
+    applications: &[Application],
+    selected: usize,
+    query: &str,
+) {
+    if width < 420 || height < 360 {
+        return;
+    }
+
+    let panel_width = width.saturating_sub(48).min(820);
+    let panel_height = height.saturating_sub(48).min(650);
+    let panel_x = (width - panel_width) / 2;
+    let panel_y = (height - panel_height) / 2;
+
+    // Translucent glass panel and subtle edge.
+    canvas.rounded_rect(panel_x, panel_y, panel_width, panel_height, 26, PANEL_BG);
+    canvas.rounded_rect(
+        panel_x + 1,
+        panel_y + 1,
+        panel_width.saturating_sub(2),
+        panel_height.saturating_sub(2),
+        25,
+        PANEL_BORDER,
+    );
+    canvas.rounded_rect(
+        panel_x + 2,
+        panel_y + 2,
+        panel_width.saturating_sub(4),
+        panel_height.saturating_sub(4),
+        24,
+        PANEL_BG,
+    );
+
+    font.draw_text(
+        canvas,
+        (panel_x + 28) as f32,
+        (panel_y + 43) as f32,
+        "Applications",
+        TEXT,
+        25.0,
+    );
+
+    font.draw_text(
+        canvas,
+        (panel_x + 29) as f32,
+        (panel_y + 65) as f32,
+        "Search and launch installed applications",
+        MUTED,
+        12.0,
+    );
+
+    let search_x = panel_x + 24;
+    let search_y = panel_y + 82;
+    let search_width = panel_width - 48;
+
+    canvas.rounded_rect(search_x, search_y, search_width, 44, 13, SEARCH_BG);
+
+    canvas.rounded_rect(search_x + 12, search_y + 12, 18, 18, 9, ACCENT);
+
+    font.draw_text(
+        canvas,
+        (search_x + 42) as f32,
+        (search_y + 28) as f32,
+        if query.is_empty() {
+            "Search applications..."
+        } else {
+            query
+        },
+        if query.is_empty() { MUTED } else { TEXT },
+        14.0,
+    );
+
+    let grid_x = panel_x + 24;
+    let grid_y = search_y + 62;
+    let available_width = panel_width - 48;
+    let card_width = (available_width - GAP * (COLUMNS as u32 - 1)) / COLUMNS as u32;
+
+    let visible_count = applications.len().min(MAX_VISIBLE);
+    let rows = visible_count.div_ceil(COLUMNS);
+    let grid_bottom = panel_y + panel_height - 42;
+    let available_height = grid_bottom.saturating_sub(grid_y);
+    let row_height = CARD_HEIGHT.min(
+        available_height.saturating_sub(GAP * rows.saturating_sub(1) as u32) / rows.max(1) as u32,
+    );
+
+    for (index, application) in applications.iter().take(visible_count).enumerate() {
+        let column = index % COLUMNS;
+        let row = index / COLUMNS;
+
+        let x = grid_x + column as u32 * (card_width + GAP);
+        let y = grid_y + row as u32 * (row_height + GAP);
+        let selected_card = index == selected;
+
+        canvas.rounded_rect(
+            x,
+            y,
+            card_width,
+            row_height,
+            15,
+            if selected_card {
+                CARD_SELECTED
+            } else {
+                CARD_BG
+            },
+        );
+
+        // Native icon resolution will replace these initials in a later step.
+        let initial = application
+            .name
+            .chars()
+            .next()
+            .unwrap_or('?')
+            .to_uppercase()
+            .to_string();
+
+        let icon_size = 38.min(row_height.saturating_sub(32));
+        let icon_x = x + (card_width.saturating_sub(icon_size)) / 2;
+        let icon_y = y + 12;
+
+        canvas.rounded_rect(
+            icon_x,
+            icon_y,
+            icon_size,
+            icon_size,
+            11,
+            if selected_card {
+                0xCC243A60
+            } else {
+                0x884D6385
+            },
+        );
+
+        let initial_width = font.text_width(&initial, 21.0);
+        font.draw_text(
+            canvas,
+            icon_x as f32 + (icon_size as f32 - initial_width) / 2.0,
+            (icon_y + 27) as f32,
+            &initial,
+            TEXT,
+            21.0,
+        );
+
+        let name = truncate(&application.name, 20);
+        let name_width = font.text_width(&name, 12.0);
+        let name_x = x as f32 + (card_width as f32 - name_width) / 2.0;
+
+        font.draw_text(
+            canvas,
+            name_x.max(x as f32 + 5.0),
+            (y + row_height - 13) as f32,
+            &name,
+            TEXT,
+            12.0,
+        );
+    }
+
+    if applications.is_empty() {
+        font.draw_text(
+            canvas,
+            (panel_x + 32) as f32,
+            (grid_y + 38) as f32,
+            "No applications found",
+            MUTED,
+            15.0,
+        );
+    }
+
+    font.draw_text(
+        canvas,
+        (panel_x + 26) as f32,
+        (panel_y + panel_height - 17) as f32,
+        "ESC  Close     ↑ ↓ ← →  Navigate     ENTER  Launch",
+        MUTED,
+        11.0,
+    );
+}
+
+fn truncate(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+
+    let result: String = chars.by_ref().take(max_chars).collect();
+
+    if chars.next().is_some() {
+        format!("{result}…")
+    } else {
+        result
+    }
+}
+
+/// Geometry shared by rendering and pointer hit-testing.
+#[derive(Clone, Copy, Debug)]
+pub struct GridPanel {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub search_x: u32,
+    pub search_y: u32,
+    pub search_width: u32,
+    pub grid_x: u32,
+    pub grid_y: u32,
+    pub card_width: u32,
+    pub row_height: u32,
+}
+
+pub fn panel_geometry(width: u32, height: u32, application_count: usize) -> Option<GridPanel> {
+    if width < 420 || height < 360 {
+        return None;
+    }
+
+    let panel_width = width.saturating_sub(48).min(820);
+    let panel_height = height.saturating_sub(48).min(650);
+    let panel_x = (width - panel_width) / 2;
+    let panel_y = (height - panel_height) / 2;
+
+    let search_x = panel_x + 24;
+    let search_y = panel_y + 82;
+    let search_width = panel_width - 48;
+    let grid_x = panel_x + 24;
+    let grid_y = search_y + 62;
+    let available_width = panel_width - 48;
+    let card_width = (available_width - GAP * (COLUMNS as u32 - 1)) / COLUMNS as u32;
+
+    let visible_count = application_count.min(MAX_VISIBLE);
+    let rows = visible_count.div_ceil(COLUMNS);
+    let grid_bottom = panel_y + panel_height - 42;
+    let available_height = grid_bottom.saturating_sub(grid_y);
+    let row_height = CARD_HEIGHT.min(
+        available_height.saturating_sub(GAP * rows.saturating_sub(1) as u32) / rows.max(1) as u32,
+    );
+
+    Some(GridPanel {
+        x: panel_x,
+        y: panel_y,
+        width: panel_width,
+        height: panel_height,
+        search_x,
+        search_y,
+        search_width,
+        grid_x,
+        grid_y,
+        card_width,
+        row_height,
+    })
+}
+
+/// Returns the visible filtered-application index under the pointer.
+pub fn application_at(
+    width: u32,
+    height: u32,
+    application_count: usize,
+    x: f64,
+    y: f64,
+) -> Option<usize> {
+    let panel = panel_geometry(width, height, application_count)?;
+    let visible_count = application_count.min(MAX_VISIBLE);
+
+    for index in 0..visible_count {
+        let column = index % COLUMNS;
+        let row = index / COLUMNS;
+        let card_x = panel.grid_x + column as u32 * (panel.card_width + GAP);
+        let card_y = panel.grid_y + row as u32 * (panel.row_height + GAP);
+
+        if x >= card_x as f64
+            && x < (card_x + panel.card_width) as f64
+            && y >= card_y as f64
+            && y < (card_y + panel.row_height) as f64
+        {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+pub fn point_inside_panel(width: u32, height: u32, x: f64, y: f64) -> bool {
+    let Some(panel) = panel_geometry(width, height, 0) else {
+        return false;
+    };
+
+    x >= panel.x as f64
+        && x < (panel.x + panel.width) as f64
+        && y >= panel.y as f64
+        && y < (panel.y + panel.height) as f64
+}

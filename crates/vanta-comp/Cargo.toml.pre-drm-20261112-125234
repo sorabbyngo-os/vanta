@@ -1,0 +1,25 @@
+[package]
+name = "vanta-comp"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1"
+vanta-ipc = { path = "../vanta-ipc" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+bitflags = "2"
+png = "0.18.1"
+
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay.git"
+rev = "6b37edc019889148608a73e3e27423979cd642c8"
+default-features = false
+features = [
+    "backend_winit",
+    "backend_session_libseat",
+    "backend_udev",
+    "wayland_frontend",
+    "desktop",
+    "renderer_gl",
+]

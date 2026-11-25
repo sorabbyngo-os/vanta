@@ -1,0 +1,13 @@
+[package]
+name = "vanta-shell"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+vanta-ipc = { path = "../vanta-ipc" }
+vanta-system = { path = "../vanta-system" }
+serde_json = "1"
+tiny-skia = { version = "0.11.4", default-features = false, features = ["std", "simd"] }
+ab_glyph = "0.2.32"

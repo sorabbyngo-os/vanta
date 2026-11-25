@@ -1,0 +1,100 @@
+use serde_json::Value;
+
+pub const PANEL_HEIGHT: u32 = 40;
+pub const DOCK_HEIGHT: u32 = 76;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Theme {
+    pub panel: u32,
+    pub glass_surface: u32,
+    pub glass_highlight: u32,
+    pub glass_edge: u32,
+    pub workspace_dot: u32,
+    pub dock: u32,
+    pub surface: u32,
+    pub surface_hover: u32,
+    pub accent: u32,
+    pub text: u32,
+    pub text_muted: u32,
+    pub border: u32,
+    pub panel_accent: u32,
+    pub quick_panel: u32,
+    pub quick_card: u32,
+    pub quick_active: u32,
+    pub quick_track: u32,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            panel: 0x90101828,
+            glass_surface: 0x603D526D,
+            glass_highlight: 0x35FFFFFF,
+            glass_edge: 0x557D91B5,
+            workspace_dot: 0xA8B9CBE0,
+            dock: 0xD91A2030,
+            surface: 0xFF252D40,
+            surface_hover: 0xFF35415A,
+            accent: 0xFF78A9FF,
+            text: 0xFFF2F5FC,
+            text_muted: 0xFF9AA8BD,
+            border: 0x557D91B5,
+            panel_accent: 0x6678A9FF,
+            quick_panel: 0xF0222427,
+            quick_card: 0xFF34373B,
+            quick_active: 0xFF45494E,
+            quick_track: 0xFF555A61,
+        }
+    }
+}
+
+impl Theme {
+    pub fn from_json(contents: &str) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(contents).map_err(|error| error.to_string())?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| "theme root must be a JSON object".to_owned())?;
+
+        let defaults = Self::default();
+        let color = |key: &str, fallback: u32| -> Result<u32, String> {
+            let Some(value) = object.get(key) else {
+                return Ok(fallback);
+            };
+
+            match value {
+                Value::String(raw) => {
+                    let raw = raw.trim();
+                    let raw = raw.strip_prefix('#').unwrap_or(raw);
+                    let raw = raw.strip_prefix("0x").unwrap_or(raw);
+                    u32::from_str_radix(raw, 16)
+                        .map_err(|_| format!("invalid color for '{key}': {raw}"))
+                }
+                Value::Number(number) => number
+                    .as_u64()
+                    .and_then(|number| u32::try_from(number).ok())
+                    .ok_or_else(|| format!("invalid numeric color for '{key}'")),
+                _ => Err(format!("'{key}' must be a hex string or integer")),
+            }
+        };
+
+        Ok(Self {
+            panel: color("panel", defaults.panel)?,
+            glass_surface: color("glass_surface", defaults.glass_surface)?,
+            glass_highlight: color("glass_highlight", defaults.glass_highlight)?,
+            glass_edge: color("glass_edge", defaults.glass_edge)?,
+            workspace_dot: color("workspace_dot", defaults.workspace_dot)?,
+            dock: color("dock", defaults.dock)?,
+            surface: color("surface", defaults.surface)?,
+            surface_hover: color("surface_hover", defaults.surface_hover)?,
+            accent: color("accent", defaults.accent)?,
+            text: color("text", defaults.text)?,
+            text_muted: color("text_muted", defaults.text_muted)?,
+            border: color("border", defaults.border)?,
+            panel_accent: color("panel_accent", defaults.panel_accent)?,
+            quick_panel: color("quick_panel", defaults.quick_panel)?,
+            quick_card: color("quick_card", defaults.quick_card)?,
+            quick_active: color("quick_active", defaults.quick_active)?,
+            quick_track: color("quick_track", defaults.quick_track)?,
+        })
+    }
+}

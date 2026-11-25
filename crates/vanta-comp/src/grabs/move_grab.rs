@@ -57,6 +57,13 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
             .find_map(|(id, window)| (window == &self.window).then_some(*id))
         {
             data.window_locations.insert(id, new_location);
+            data.motion.animate_window(
+                id,
+                f64::from(new_location.x),
+                f64::from(new_location.y),
+                1.0,
+                1.0,
+            );
         }
 
         // Minimize activates when the dragged window's bottom edge enters
@@ -159,6 +166,11 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
                     .find_map(|(id, window)| (window == &self.window).then_some(*id))
                 {
                     data.window_locations.insert(id, rect.loc);
+                    data.motion.snap_window_position(
+                        id,
+                        f64::from(rect.loc.x),
+                        f64::from(rect.loc.y),
+                    );
                 }
 
                 if let Some(toplevel) = self.window.toplevel().filter(|toplevel| toplevel.alive()) {
