@@ -1,0 +1,344 @@
+//! Independent software master gain and physical output-volume control.
+//!
+//! System master gain is applied to application playback streams. Output
+//! volume is applied to the selected physical sink. No global audio
+//! configuration files are modified.
+
+use std::{
+    collections::{BTreeMap, HashMap},
+    process::Command,
+};
+
+use serde_json::Value;
+
+const PULSE_NORM: f64 = 65_536.0;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OutputDevice {
+    pub name: String,
+    pub description: String,
+    pub is_bluetooth: bool,
+    pub volume_percent: u32,
+    pub muted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AudioSnapshot {
+    pub master_percent: u32,
+    pub output: Option<OutputDevice>,
+    pub active_streams: usize,
+}
+
+#[derive(Debug, Clone)]
+struct StreamBaseline {
+    identity: String,
+    channels: BTreeMap<String, f64>,
+    last_gain: f64,
+}
+
+/// Own this controller on the control-worker thread, not the UI thread.
+#[derive(Debug, Default)]
+pub struct AudioController {
+    master_percent: u32,
+    streams: HashMap<u32, StreamBaseline>,
+}
+
+impl AudioController {
+    pub fn new() -> Self {
+        Self {
+            master_percent: 100,
+            streams: HashMap::new(),
+        }
+    }
+
+    pub fn master_percent(&self) -> u32 {
+        self.master_percent
+    }
+
+    pub fn stream_count(&self) -> usize {
+        self.streams.len()
+    }
+
+    /// Apply software master gain to every currently active application stream.
+    /// Newly observed streams are captured at their current per-channel levels.
+    pub fn set_master_percent(&mut self, percent: u32) -> Result<(), String> {
+        self.master_percent = percent.min(100);
+        self.refresh_streams()
+    }
+
+    /// Discover new streams, reconcile external per-app volume changes, and
+    /// reapply the current software master gain.
+    pub fn refresh_streams(&mut self) -> Result<(), String> {
+        let output = run_pactl(&["-f", "json", "list", "sink-inputs"])?;
+        let entries: Vec<Value> = serde_json::from_slice(&output)
+            .map_err(|error| format!("cannot parse pactl sink-inputs JSON: {error}"))?;
+
+        let mut seen = HashMap::new();
+        let gain = self.master_percent as f64 / 100.0;
+
+        for entry in entries {
+            let Some(id) = entry
+                .get("index")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+            else {
+                continue;
+            };
+
+            let channels = match parse_channels(entry.get("volume")) {
+                Some(channels) if !channels.is_empty() => channels,
+                _ => continue,
+            };
+
+            let identity = stream_identity(&entry);
+            let baseline = match self.streams.get_mut(&id) {
+                Some(existing) if existing.identity == identity => {
+                    // If the observed value differs from what Vanta last set,
+                    // treat it as an external per-app volume adjustment.
+                    reconcile_external_change(existing, &channels);
+                    existing
+                }
+                _ => {
+                    self.streams.insert(
+                        id,
+                        StreamBaseline {
+                            identity: identity.clone(),
+                            channels: channels.clone(),
+                            last_gain: 1.0,
+                        },
+                    );
+                    self.streams.get_mut(&id).expect("stream was just inserted")
+                }
+            };
+
+            seen.insert(id, ());
+            let channel_map = entry.get("channel_map").and_then(Value::as_str);
+            apply_stream_gain(id, baseline, gain, channel_map)?;
+        }
+
+        self.streams.retain(|id, _| seen.contains_key(id));
+        Ok(())
+    }
+
+    /// Read the selected physical output and its independent sink volume.
+    pub fn read_output(&self) -> Result<Option<OutputDevice>, String> {
+        let default_name = run_pactl(&["get-default-sink"])?;
+        let default_name = String::from_utf8_lossy(&default_name).trim().to_owned();
+        if default_name.is_empty() {
+            return Ok(None);
+        }
+
+        let output = run_pactl(&["-f", "json", "list", "sinks"])?;
+        let entries: Vec<Value> = serde_json::from_slice(&output)
+            .map_err(|error| format!("cannot parse pactl sinks JSON: {error}"))?;
+
+        let Some(sink) = entries
+            .iter()
+            .find(|sink| sink.get("name").and_then(Value::as_str) == Some(default_name.as_str()))
+        else {
+            return Ok(None);
+        };
+
+        let properties = sink.get("properties");
+        let bus = properties
+            .and_then(|value| value.get("device.bus"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+
+        let description = sink
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or(&default_name)
+            .to_owned();
+
+        let volume_percent = parse_channels(sink.get("volume"))
+            .and_then(|channels| {
+                if channels.is_empty() {
+                    None
+                } else {
+                    let average = channels.values().sum::<f64>() / channels.len() as f64;
+                    Some((average * 100.0).round().clamp(0.0, 150.0) as u32)
+                }
+            })
+            .unwrap_or(0);
+
+        Ok(Some(OutputDevice {
+            name: default_name,
+            description,
+            is_bluetooth: bus.eq_ignore_ascii_case("bluetooth"),
+            volume_percent,
+            muted: sink.get("mute").and_then(Value::as_bool).unwrap_or(false),
+        }))
+    }
+
+    pub fn set_output_percent(&self, percent: u32) -> Result<(), String> {
+        let name = self.default_sink_name()?;
+        let value = format!("{}%", percent.min(150));
+        run_pactl_status(&["set-sink-volume", &name, &value])
+    }
+
+    pub fn set_output_muted(&self, muted: bool) -> Result<(), String> {
+        let name = self.default_sink_name()?;
+        run_pactl_status(&["set-sink-mute", &name, if muted { "1" } else { "0" }])
+    }
+
+    pub fn snapshot(&self) -> Result<AudioSnapshot, String> {
+        Ok(AudioSnapshot {
+            master_percent: self.master_percent,
+            output: self.read_output()?,
+            active_streams: self.streams.len(),
+        })
+    }
+
+    fn default_sink_name(&self) -> Result<String, String> {
+        let output = run_pactl(&["get-default-sink"])?;
+        let name = String::from_utf8_lossy(&output).trim().to_owned();
+        if name.is_empty() {
+            Err("PulseAudio/PipeWire did not report a default output sink".to_owned())
+        } else {
+            Ok(name)
+        }
+    }
+}
+
+fn parse_channels(volume: Option<&Value>) -> Option<BTreeMap<String, f64>> {
+    let object = volume?.as_object()?;
+    let mut channels = BTreeMap::new();
+
+    for (name, value) in object {
+        let raw = value
+            .get("value")?
+            .as_f64()
+            .or_else(|| value.get("value")?.as_u64().map(|v| v as f64))?;
+        channels.insert(name.clone(), (raw / PULSE_NORM).max(0.0));
+    }
+
+    Some(channels)
+}
+
+fn stream_identity(entry: &Value) -> String {
+    let properties = entry.get("properties");
+    let app = properties
+        .and_then(|value| value.get("application.name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let media = properties
+        .and_then(|value| value.get("media.name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+
+    format!(
+        "{}|{}|{}",
+        app,
+        media,
+        entry
+            .get("sink")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+    )
+}
+
+fn reconcile_external_change(baseline: &mut StreamBaseline, observed: &BTreeMap<String, f64>) {
+    for (channel, current) in observed {
+        let previous = baseline.channels.get(channel).copied().unwrap_or(*current);
+        let expected = previous * baseline.last_gain;
+
+        // pactl reports integer volume units. Allow a small rounding margin.
+        if (current - expected).abs() > 0.025 {
+            let recovered = if baseline.last_gain > 0.001 {
+                current / baseline.last_gain
+            } else {
+                *current
+            };
+            baseline
+                .channels
+                .insert(channel.clone(), recovered.max(0.0));
+        }
+    }
+
+    baseline
+        .channels
+        .retain(|name, _| observed.contains_key(name));
+}
+
+fn apply_stream_gain(
+    id: u32,
+    baseline: &mut StreamBaseline,
+    gain: f64,
+    channel_map: Option<&str>,
+) -> Result<(), String> {
+    let mut args = vec!["set-sink-input-volume".to_owned(), id.to_string()];
+
+    // Follow PulseAudio's channel-map order rather than BTreeMap order.
+    let mut ordered_channels: Vec<&str> = channel_map
+        .unwrap_or_default()
+        .split(',')
+        .filter(|channel| baseline.channels.contains_key(*channel))
+        .collect();
+
+    // Retain channels not represented in the channel map.
+    for channel in baseline.channels.keys() {
+        if !ordered_channels.contains(&channel.as_str()) {
+            ordered_channels.push(channel.as_str());
+        }
+    }
+
+    for channel in ordered_channels {
+        let original = baseline.channels[channel];
+        let percent = (original * gain * 100.0).round().clamp(0.0, 150.0);
+        args.push(format!("{percent:.0}%"));
+    }
+
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_pactl_status(&refs)?;
+    baseline.last_gain = gain;
+    Ok(())
+}
+
+fn run_pactl(args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = Command::new("pactl")
+        .args(args)
+        .output()
+        .map_err(|error| format!("cannot execute pactl: {error}"))?;
+
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        Err(format!(
+            "pactl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
+}
+
+fn run_pactl_status(args: &[&str]) -> Result<(), String> {
+    run_pactl(args).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_stereo_channel_volumes() {
+        let value: Value = serde_json::json!({
+            "front-left": {"value": 32768},
+            "front-right": {"value": 65536}
+        });
+
+        let channels = parse_channels(Some(&value)).unwrap();
+        assert!((channels["front-left"] - 0.5).abs() < 0.001);
+        assert!((channels["front-right"] - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn detects_bluetooth_sink_identity() {
+        let value: Value = serde_json::json!({
+            "properties": {"device.bus": "bluetooth"}
+        });
+
+        let bus = value["properties"]["device.bus"].as_str().unwrap();
+        assert!(bus.eq_ignore_ascii_case("bluetooth"));
+    }
+}

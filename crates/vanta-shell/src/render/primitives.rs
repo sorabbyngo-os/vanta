@@ -14,6 +14,13 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn clear(&mut self, color: u32) {
+        // Transparent clears are common for layer-shell surfaces. Use the
+        // optimized slice fill instead of writing four bytes per pixel.
+        if color == 0 {
+            self.pixels.fill(0);
+            return;
+        }
+
         let alpha = ((color >> 24) & 0xFF) as u32;
         let red = ((color >> 16) & 0xFF) as u32;
         let green = ((color >> 8) & 0xFF) as u32;
@@ -240,6 +247,8 @@ impl<'a> Canvas<'a> {
 
     /// Draw a rounded rectangle using fractional geometry and 4x4 coverage
     /// sampling. This avoids temporary pixmap allocations for individual shapes.
+    /// Draw a rounded rectangle using fast interior blending and 4x4
+    /// coverage sampling only for boundary pixels.
     pub fn rounded_rect_f(
         &mut self,
         x: f32,
@@ -278,6 +287,7 @@ impl<'a> Canvas<'a> {
         let start_y = y.floor().max(0.0) as u32;
         let end_x = right.ceil().min(self.width as f32) as u32;
         let end_y = bottom.ceil().min(self.height as f32) as u32;
+
         const SAMPLE_OFFSETS: [f32; 4] = [0.125, 0.375, 0.625, 0.875];
 
         let inner_left = x + radius;
@@ -287,11 +297,37 @@ impl<'a> Canvas<'a> {
         let radius_squared = radius * radius;
 
         for py in start_y..end_y {
+            let pixel_top = py as f32;
+            let pixel_bottom = pixel_top + 1.0;
+
+            let inside_vertical_bounds = pixel_top >= y && pixel_bottom <= bottom;
+
+            let inside_horizontal_center = pixel_top >= inner_top && pixel_bottom <= inner_bottom;
+
             for px in start_x..end_x {
+                let pixel_left = px as f32;
+                let pixel_right = pixel_left + 1.0;
+
+                let inside_horizontal_bounds = pixel_left >= x && pixel_right <= right;
+
+                let inside_vertical_center = pixel_left >= inner_left && pixel_right <= inner_right;
+
+                // A complete pixel inside either central strip is guaranteed
+                // to be covered. Skip all 16 supersampling operations.
+                if inside_vertical_bounds
+                    && inside_horizontal_bounds
+                    && (inside_horizontal_center || inside_vertical_center)
+                {
+                    self.blend_pixel(px, py, color);
+                    continue;
+                }
+
+                // Preserve the original 4x4 antialiasing for boundary pixels.
                 let mut covered = 0_u32;
 
                 for offset_y in SAMPLE_OFFSETS {
-                    let sample_y = py as f32 + offset_y;
+                    let sample_y = pixel_top + offset_y;
+
                     if sample_y < y || sample_y > bottom {
                         continue;
                     }
@@ -305,7 +341,7 @@ impl<'a> Canvas<'a> {
                     };
 
                     for offset_x in SAMPLE_OFFSETS {
-                        let sample_x = px as f32 + offset_x;
+                        let sample_x = pixel_left + offset_x;
 
                         if sample_x < x || sample_x > right {
                             continue;
@@ -328,6 +364,65 @@ impl<'a> Canvas<'a> {
                 if covered != 0 {
                     self.blend_coverage(px as i32, py as i32, color, covered as f32 / 16.0);
                 }
+            }
+        }
+    }
+
+    /// Composite a premultiplied BGRA image onto this canvas.
+    ///
+    /// Source and destination use the same pixel representation as
+    /// wl_shm ARGB8888 on this renderer.
+    pub fn blit_premultiplied(
+        &mut self,
+        source: &[u8],
+        source_width: u32,
+        source_height: u32,
+        x: u32,
+        y: u32,
+    ) {
+        if source_width == 0 || source_height == 0 || x >= self.width || y >= self.height {
+            return;
+        }
+
+        let required = source_width as usize * source_height as usize * 4;
+
+        if source.len() < required {
+            return;
+        }
+
+        let copy_width = source_width.min(self.width - x);
+        let copy_height = source_height.min(self.height - y);
+
+        for sy in 0..copy_height {
+            for sx in 0..copy_width {
+                let src_index = ((sy * source_width + sx) * 4) as usize;
+                let dst_index = (((y + sy) * self.width + (x + sx)) * 4) as usize;
+
+                let alpha = source[src_index + 3] as u32;
+
+                if alpha == 0 {
+                    continue;
+                }
+
+                if alpha == 255 {
+                    self.pixels[dst_index..dst_index + 4]
+                        .copy_from_slice(&source[src_index..src_index + 4]);
+                    continue;
+                }
+
+                let inverse = 255 - alpha;
+
+                for channel in 0..3 {
+                    let src = source[src_index + channel] as u32;
+                    let dst = self.pixels[dst_index + channel] as u32;
+
+                    self.pixels[dst_index + channel] =
+                        (src + (dst * inverse + 127) / 255).min(255) as u8;
+                }
+
+                let dst_alpha = self.pixels[dst_index + 3] as u32;
+                self.pixels[dst_index + 3] =
+                    (alpha + (dst_alpha * inverse + 127) / 255).min(255) as u8;
             }
         }
     }

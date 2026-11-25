@@ -1,4 +1,4 @@
-use super::{font::FontRenderer, primitives::Canvas, theme};
+use super::{font::FontRenderer, primitives::Canvas, theme::Theme};
 
 pub fn draw(
     canvas: &mut Canvas<'_>,
@@ -8,6 +8,7 @@ pub fn draw(
     workspace_count: u32,
     active_workspace: u32,
     controls_hovered: bool,
+    colors: &Theme,
 ) {
     if width == 0 || height == 0 {
         return;
@@ -36,17 +37,10 @@ pub fn draw(
         activities_width,
         control_h,
         10.0,
-        theme::COLOR_GLASS_SURFACE,
+        colors.glass_surface,
     );
 
-    font.draw_text(
-        canvas,
-        25.0,
-        baseline,
-        "Activities",
-        theme::COLOR_TEXT,
-        13.0,
-    );
+    font.draw_text(canvas, 25.0, baseline, "Activities", colors.text, 13.0);
 
     let dots_start = 25.0 + font.text_width("Activities", 13.0) + 15.0;
 
@@ -63,9 +57,9 @@ pub fn draw(
             dot_size,
             dot_size * 0.5,
             if is_active {
-                theme::COLOR_ACCENT
+                colors.accent
             } else {
-                theme::COLOR_WORKSPACE_DOT
+                colors.workspace_dot
             },
         );
     }
@@ -73,14 +67,7 @@ pub fn draw(
     // Apps and Places navigation.
     let nav_x = 12.0 + activities_width + 22.0;
 
-    font.draw_text(
-        canvas,
-        nav_x,
-        baseline,
-        "Apps",
-        theme::COLOR_TEXT_MUTED,
-        12.0,
-    );
+    font.draw_text(canvas, nav_x, baseline, "Apps", colors.text_muted, 12.0);
 
     let places_x = nav_x + font.text_width("Apps", 12.0) + 24.0;
 
@@ -89,7 +76,7 @@ pub fn draw(
         places_x,
         baseline,
         "Places",
-        theme::COLOR_TEXT_MUTED,
+        colors.text_muted,
         12.0,
     );
 
@@ -108,7 +95,7 @@ pub fn draw(
             pill_width,
             control_h,
             10.0,
-            theme::COLOR_GLASS_SURFACE,
+            colors.glass_surface,
         );
 
         font.draw_text(
@@ -116,7 +103,7 @@ pub fn draw(
             pill_x + 12.0,
             baseline,
             &label,
-            theme::COLOR_TEXT_MUTED,
+            colors.text_muted,
             10.5,
         );
     }
@@ -129,9 +116,9 @@ pub fn draw(
         quick_height,
         10.0,
         if controls_hovered {
-            theme::COLOR_PANEL_ACCENT
+            colors.panel_accent
         } else {
-            theme::COLOR_GLASS_SURFACE
+            colors.glass_surface
         },
     );
     font.draw_text(
@@ -139,7 +126,7 @@ pub fn draw(
         quick_x + 17.0,
         quick_y + 19.0,
         "Controls",
-        theme::COLOR_TEXT,
+        colors.text,
         12.0,
     );
 }

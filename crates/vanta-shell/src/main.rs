@@ -1,11 +1,16 @@
 //! Vanta shell — top panel and bottom dock via wlr-layer-shell.
 
+mod application_worker;
+mod audio;
 mod control_worker;
+mod dock_preferences;
 mod ipc;
 mod render;
+mod storage_worker;
 
 use std::{
     num::NonZeroU32,
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -20,6 +25,7 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::KeyboardHandler,
         pointer::{PointerEvent, PointerEventKind, PointerHandler, BTN_LEFT},
         Capability, SeatHandler, SeatState,
     },
@@ -32,10 +38,14 @@ use smithay_client_toolkit::{
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
+use vanta_apps::{
+    process_manager::{ProcessEvent, RunningProcess},
+    Application,
+};
 use vanta_ipc::{Action, ActionResult, MinimizedWindowInfo};
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, QueueHandle,
 };
 
@@ -43,7 +53,7 @@ const BAR_H: u32 = render::theme::PANEL_HEIGHT;
 const DOCK_SURFACE_HEIGHT: u32 = render::theme::DOCK_HEIGHT + 16;
 const INITIAL_WIDTH: u32 = 1280;
 const QUICK_SETTINGS_WIDTH: u32 = 376;
-const QUICK_SETTINGS_HEIGHT: u32 = 520;
+const QUICK_SETTINGS_HEIGHT: u32 = 480;
 
 fn main() {
     let conn = Connection::connect_to_env().expect("WAYLAND_DISPLAY is not set");
@@ -71,6 +81,10 @@ fn main() {
 
     let (control_sender, control_receiver) = channel::channel();
 
+    let (storage_sender, storage_receiver) = channel::channel();
+    let (application_sender, application_receiver) = channel::channel();
+    let (icon_sender, icon_receiver) = channel::channel();
+
     event_loop
         .handle()
         .insert_source(control_receiver, |event, _, shell| match event {
@@ -81,10 +95,57 @@ fn main() {
         })
         .expect("Failed to register the Controls worker channel");
 
+    event_loop
+        .handle()
+        .insert_source(storage_receiver, |event, _, shell| match event {
+            channel::Event::Msg(event) => shell.handle_storage_event(event),
+            channel::Event::Closed => {
+                eprintln!("vanta-shell: Storage worker channel closed");
+            }
+        })
+        .expect("Failed to register the Storage worker channel");
+
+    event_loop
+        .handle()
+        .insert_source(icon_receiver, |event, _, shell| match event {
+            channel::Event::Msg(_) => {
+                shell.request_application_grid_redraw();
+                let _ = shell.draw_dock(false);
+            }
+            channel::Event::Closed => {
+                eprintln!("vanta-shell: Icon worker channel closed");
+            }
+        })
+        .expect("Failed to register the Icon worker channel");
+
+    event_loop
+        .handle()
+        .insert_source(application_receiver, |event, _, shell| match event {
+            channel::Event::Msg(event) => shell.handle_application_event(event),
+            channel::Event::Closed => {
+                eprintln!("vanta-shell: Application worker channel closed");
+            }
+        })
+        .expect("Failed to register the Application worker channel");
+
     let ipc_client = ipc::IpcClient::new(ipc_sender).expect("Failed to start the IPC worker");
     let control_worker = control_worker::ControlWorker::new(control_sender)
         .expect("Failed to start the Controls worker");
+    let storage_worker = storage_worker::StorageWorker::new(storage_sender)
+        .expect("Failed to start the Storage worker");
+    let application_worker = application_worker::ApplicationWorker::new(application_sender)
+        .expect("Failed to start the Application worker");
+
+    render::icon_cache::initialize(icon_sender).expect("Failed to initialize the icon loader");
     let font_renderer = render::font::FontRenderer::load().expect("Failed to load Vanta's UI font");
+    let theme_path = std::env::var_os("VANTA_THEME_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ui/theme.json"));
+    let initial_theme_contents = std::fs::read_to_string(&theme_path).ok();
+    let theme = initial_theme_contents
+        .as_deref()
+        .and_then(|contents| render::theme::Theme::from_json(contents).ok())
+        .unwrap_or_default();
 
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("zwlr_layer_shell_v1");
@@ -122,10 +183,15 @@ fn main() {
         seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
         pointer: None,
+        keyboard: None,
+        keyboard_modifiers: Default::default(),
         compositor: compositor.clone(),
         layer_shell,
         shm,
         font_renderer,
+        theme,
+        theme_path,
+        last_theme_contents: initial_theme_contents,
         panel_pool,
         dock_pool,
         panel_layer: Some(panel_layer),
@@ -135,9 +201,24 @@ fn main() {
         quick_settings_width: QUICK_SETTINGS_WIDTH,
         quick_settings_height: QUICK_SETTINGS_HEIGHT,
         quick_settings_first_configure: true,
+        quick_settings_redraw_pending: false,
+        application_grid_layer: None,
+        application_grid_pool: None,
+        application_grid_width: INITIAL_WIDTH,
+        application_grid_height: 720,
+        application_grid_first_configure: true,
+        application_grid_redraw_pending: false,
+        application_grid_query: String::new(),
+        application_grid_selected: 0,
+        application_grid_keyboard_focused: false,
+        quick_settings_expanded: render::quick_settings::ConnectivityPanel::None,
+        quick_settings_workspaces_hovered: false,
+        quick_settings_add_workspace_hovered: false,
         control_state: render::quick_settings::ControlState::default(),
         volume_slider_dragging: false,
         last_volume_slider_percent: None,
+        output_volume_slider_dragging: false,
+        last_output_volume_slider_percent: None,
         brightness_slider_dragging: false,
         last_brightness_slider_percent: None,
         controls_hovered: false,
@@ -151,8 +232,19 @@ fn main() {
         exit: false,
         workspace_count: 1,
         active_workspace: 0,
+        workspace_sync_request_id: None,
         minimized_windows: Vec::new(),
+        dock_icon_cache: None,
+        dock_background_cache: None,
         control_worker,
+        _storage_worker: storage_worker,
+        application_worker,
+
+        applications: Vec::new(),
+        dock_preferences: dock_preferences::DockPreferences::default(),
+        running_processes: Vec::new(),
+
+        storage_view: None,
         ipc_client,
     };
 
@@ -160,22 +252,129 @@ fn main() {
         eprintln!("vanta-shell: cannot request minimized windows: {error}");
     }
 
-    if let Err(error) = shell.ipc_client.request(Action::ListWorkspaces) {
-        eprintln!("vanta-shell: cannot request workspace state: {error}");
+    match shell.ipc_client.request(Action::ListWorkspaces) {
+        Ok(request_id) => shell.workspace_sync_request_id = Some(request_id),
+        Err(error) => {
+            eprintln!("vanta-shell: cannot request workspace state: {error}");
+        }
     }
 
     let mut last_workspace_sync = Instant::now();
+    let mut last_theme_check = Instant::now();
+
+    let mut benchmark_render_enabled = std::env::var_os("VANTA_BENCH_RENDER").is_some();
+    let mut benchmark_started: Option<Instant> = None;
+    let mut last_benchmark_frame = Instant::now();
+    let mut benchmark_frames: u64 = 0;
+
+    let mut benchmark_panel_total = Duration::ZERO;
+    let mut benchmark_dock_total = Duration::ZERO;
+
+    let mut benchmark_panel_max = Duration::ZERO;
+    let mut benchmark_dock_max = Duration::ZERO;
+    let mut benchmark_dock_stage_total = [Duration::ZERO; 8];
+    let mut benchmark_dock_stage_max = [Duration::ZERO; 8];
+    let benchmark_duration = Duration::from_secs(30);
+    let benchmark_interval = Duration::from_millis(33);
 
     while !shell.exit {
         event_loop
             .dispatch(Duration::from_millis(16), &mut shell)
             .unwrap();
 
-        if last_workspace_sync.elapsed() >= Duration::from_millis(500) {
-            if let Err(error) = shell.ipc_client.request(Action::ListWorkspaces) {
-                eprintln!("vanta-shell: workspace sync request failed: {error}");
+        shell.flush_quick_settings_redraw();
+        shell.flush_application_grid_redraw();
+
+        if benchmark_render_enabled && !shell.panel_first_configure && !shell.dock_first_configure {
+            let now = Instant::now();
+
+            match benchmark_started {
+                None => {
+                    benchmark_started = Some(now);
+                    last_benchmark_frame = now;
+                    eprintln!("VANTA_BENCH: started; rendering panel and dock for 30 seconds");
+                }
+                Some(started) if now.duration_since(started) >= benchmark_duration => {
+                    benchmark_render_enabled = false;
+                    let elapsed = now.duration_since(started).as_secs_f64();
+                    let frames = benchmark_frames.max(1) as f64;
+
+                    eprintln!(
+                        "VANTA_BENCH: completed frames={} rate={:.2}/s panel_avg={:.3}ms panel_max={:.3}ms dock_avg={:.3}ms dock_max={:.3}ms",
+                        benchmark_frames,
+                        benchmark_frames as f64 / elapsed,
+                        benchmark_panel_total.as_secs_f64() * 1000.0 / frames,
+                        benchmark_panel_max.as_secs_f64() * 1000.0,
+                        benchmark_dock_total.as_secs_f64() * 1000.0 / frames,
+                        benchmark_dock_max.as_secs_f64() * 1000.0,
+                    );
+
+                    const STAGE_NAMES: [&str; 8] = [
+                        "buffer_alloc",
+                        "canvas_clear",
+                        "background_cache",
+                        "glass_blit",
+                        "app_icons",
+                        "workspaces",
+                        "minimized_cards",
+                        "buffer_submit",
+                    ];
+
+                    for index in 0..STAGE_NAMES.len() {
+                        eprintln!(
+                            "VANTA_BENCH: dock_stage={} avg={:.3}ms max={:.3}ms",
+                            STAGE_NAMES[index],
+                            benchmark_dock_stage_total[index].as_secs_f64() * 1000.0 / frames,
+                            benchmark_dock_stage_max[index].as_secs_f64() * 1000.0,
+                        );
+                    }
+                }
+                Some(_) if now.duration_since(last_benchmark_frame) >= benchmark_interval => {
+                    let panel_started = Instant::now();
+                    shell.draw_panel();
+                    let panel_elapsed = panel_started.elapsed();
+
+                    let dock_started = Instant::now();
+                    let dock_timings = shell.draw_dock(true).unwrap_or([Duration::ZERO; 8]);
+                    let dock_elapsed = dock_started.elapsed();
+
+                    benchmark_frames += 1;
+
+                    benchmark_panel_total += panel_elapsed;
+                    benchmark_dock_total += dock_elapsed;
+
+                    benchmark_panel_max = benchmark_panel_max.max(panel_elapsed);
+                    benchmark_dock_max = benchmark_dock_max.max(dock_elapsed);
+
+                    for index in 0..8 {
+                        benchmark_dock_stage_total[index] += dock_timings[index];
+                        benchmark_dock_stage_max[index] =
+                            benchmark_dock_stage_max[index].max(dock_timings[index]);
+                    }
+
+                    last_benchmark_frame = now;
+                }
+                Some(_) => {}
             }
-            last_workspace_sync = Instant::now();
+        }
+
+        if last_theme_check.elapsed() >= Duration::from_millis(200) {
+            shell.reload_theme_if_changed();
+            last_theme_check = Instant::now();
+        }
+
+        if last_workspace_sync.elapsed() >= Duration::from_secs(1)
+            && shell.workspace_sync_request_id.is_none()
+        {
+            match shell.ipc_client.request(Action::ListWorkspaces) {
+                Ok(request_id) => {
+                    shell.workspace_sync_request_id = Some(request_id);
+                    last_workspace_sync = Instant::now();
+                }
+                Err(error) => {
+                    eprintln!("vanta-shell: workspace sync request failed: {error}");
+                }
+            }
         }
     }
 }
@@ -185,10 +384,15 @@ struct VantaShell {
     seat_state: SeatState,
     output_state: OutputState,
     pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboard_modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
     font_renderer: render::font::FontRenderer,
+    theme: render::theme::Theme,
+    theme_path: PathBuf,
+    last_theme_contents: Option<String>,
 
     panel_pool: SlotPool,
     dock_pool: SlotPool,
@@ -200,10 +404,33 @@ struct VantaShell {
     quick_settings_width: u32,
     quick_settings_height: u32,
     quick_settings_first_configure: bool,
+    quick_settings_redraw_pending: bool,
+
+    application_grid_layer: Option<LayerSurface>,
+    application_grid_pool: Option<SlotPool>,
+    application_grid_width: u32,
+    application_grid_height: u32,
+    application_grid_first_configure: bool,
+    application_grid_redraw_pending: bool,
+    application_grid_query: String,
+    application_grid_selected: usize,
+    application_grid_keyboard_focused: bool,
+    quick_settings_expanded: render::quick_settings::ConnectivityPanel,
+    quick_settings_workspaces_hovered: bool,
+    quick_settings_add_workspace_hovered: bool,
     control_state: render::quick_settings::ControlState,
     control_worker: control_worker::ControlWorker,
+    _storage_worker: storage_worker::StorageWorker,
+    application_worker: application_worker::ApplicationWorker,
+    applications: Vec<Application>,
+    dock_preferences: dock_preferences::DockPreferences,
+    running_processes: Vec<RunningProcess>,
+
+    storage_view: Option<vanta_system::storage_state::StorageStateView>,
     volume_slider_dragging: bool,
     last_volume_slider_percent: Option<u32>,
+    output_volume_slider_dragging: bool,
+    last_output_volume_slider_percent: Option<u32>,
     brightness_slider_dragging: bool,
     last_brightness_slider_percent: Option<u32>,
     controls_hovered: bool,
@@ -220,13 +447,48 @@ struct VantaShell {
     exit: bool,
     workspace_count: u32,
     active_workspace: u32,
+    workspace_sync_request_id: Option<u64>,
     minimized_windows: Vec<MinimizedWindowInfo>,
+    dock_icon_cache: Option<render::dock::IconCache>,
+    dock_background_cache: Option<render::dock::DockBackgroundCache>,
     ipc_client: ipc::IpcClient,
 }
 
 impl VantaShell {
+    fn reload_theme_if_changed(&mut self) {
+        let Ok(contents) = std::fs::read_to_string(&self.theme_path) else {
+            return;
+        };
+
+        if self.last_theme_contents.as_deref() == Some(contents.as_str()) {
+            return;
+        }
+
+        match render::theme::Theme::from_json(&contents) {
+            Ok(theme) => {
+                self.theme = theme;
+                self.last_theme_contents = Some(contents);
+                eprintln!("vanta-shell: theme reloaded");
+
+                if !self.panel_first_configure {
+                    self.draw_panel();
+                }
+                if !self.dock_first_configure {
+                    let _ = self.draw_dock(false);
+                }
+                if self.quick_settings_layer.is_some() {
+                    self.request_quick_settings_redraw();
+                }
+            }
+            Err(error) => {
+                self.last_theme_contents = Some(contents);
+                eprintln!("vanta-shell: invalid theme file: {error}");
+            }
+        }
+    }
+
     fn update_volume_slider(&mut self, x: f64) {
-        let percent = (((x - 112.0) / 176.0) * 100.0).round().clamp(0.0, 100.0) as u32;
+        let percent = (((x - 44.0) / 288.0) * 100.0).round().clamp(0.0, 100.0) as u32;
 
         if self.last_volume_slider_percent == Some(percent) {
             return;
@@ -234,11 +496,11 @@ impl VantaShell {
 
         self.last_volume_slider_percent = Some(percent);
 
-        let action = render::quick_settings::ControlAction::SetVolumePercent(percent);
+        let action = render::quick_settings::ControlAction::SetSystemVolumePercent(percent);
 
         self.control_state.apply_optimistic(action);
         if self.quick_settings_layer.is_some() {
-            self.draw_quick_settings();
+            self.request_quick_settings_redraw();
         }
 
         if let Err(error) = self.control_worker.perform(action) {
@@ -246,8 +508,29 @@ impl VantaShell {
         }
     }
 
+    fn update_output_volume_slider(&mut self, x: f64) {
+        let percent = (((x - 44.0) / 288.0) * 150.0).round().clamp(0.0, 150.0) as u32;
+
+        if self.last_output_volume_slider_percent == Some(percent) {
+            return;
+        }
+
+        self.last_output_volume_slider_percent = Some(percent);
+
+        let action = render::quick_settings::ControlAction::SetOutputVolumePercent(percent);
+
+        self.control_state.apply_optimistic(action);
+        if self.quick_settings_layer.is_some() {
+            self.request_quick_settings_redraw();
+        }
+
+        if let Err(error) = self.control_worker.perform(action) {
+            eprintln!("vanta-shell: cannot queue output-volume update: {error}");
+        }
+    }
+
     fn update_brightness_slider(&mut self, x: f64) {
-        let percent = (((x - 28.0) / 320.0) * 100.0).round().clamp(0.0, 100.0) as u32;
+        let percent = (((x - 44.0) / 288.0) * 100.0).round().clamp(0.0, 100.0) as u32;
 
         if self.last_brightness_slider_percent == Some(percent) {
             return;
@@ -257,7 +540,7 @@ impl VantaShell {
         self.control_state.brightness_percent = Some(percent);
 
         if self.quick_settings_layer.is_some() {
-            self.draw_quick_settings();
+            self.request_quick_settings_redraw();
         }
     }
 
@@ -267,14 +550,99 @@ impl VantaShell {
                 if self.control_state != state {
                     self.control_state = state;
                     if self.quick_settings_layer.is_some() {
-                        self.draw_quick_settings();
+                        self.request_quick_settings_redraw();
                     }
                 }
             }
         }
     }
 
+    fn handle_application_event(&mut self, event: application_worker::ApplicationEvent) {
+        match event {
+            application_worker::ApplicationEvent::CatalogReady(applications) => {
+                let count = applications.len();
+                self.applications = applications;
+                self.request_application_grid_redraw();
+                self.dock_preferences = dock_preferences::DockPreferences::load();
+                self.dock_preferences
+                    .pinned
+                    .retain(|id| self.applications.iter().any(|app| app.id == *id));
+                eprintln!("vanta-shell: discovered {count} applications");
+                let _ = self.draw_dock(false);
+            }
+            application_worker::ApplicationEvent::Process(ProcessEvent::Started(process)) => {
+                eprintln!(
+                    "vanta-shell: application process started pid={} executable={}",
+                    process.pid,
+                    process.executable.display()
+                );
+                self.running_processes.push(process);
+                self.request_application_grid_redraw();
+            }
+            application_worker::ApplicationEvent::Process(ProcessEvent::Exited {
+                process,
+                success,
+                exit_code,
+            }) => {
+                self.running_processes
+                    .retain(|running| running.launch_id != process.launch_id);
+                self.request_application_grid_redraw();
+                eprintln!(
+                    "vanta-shell: application process exited pid={} success={} code={:?}",
+                    process.pid, success, exit_code
+                );
+            }
+            application_worker::ApplicationEvent::DbusActivated { application_id } => {
+                eprintln!("vanta-shell: D-Bus application activated: {application_id}");
+            }
+            application_worker::ApplicationEvent::TerminalRequested {
+                application_id,
+                executable,
+                arguments,
+                working_directory,
+                startup_wm_class,
+            } => {
+                eprintln!(
+                    "vanta-shell: terminal launch requested for {application_id}: {} ({})",
+                    executable.display(),
+                    arguments.len()
+                );
+                let _ = (working_directory, startup_wm_class);
+            }
+            application_worker::ApplicationEvent::LaunchFailed {
+                application_id,
+                error,
+            } => {
+                eprintln!("vanta-shell: failed to launch {application_id}: {error}");
+            }
+            application_worker::ApplicationEvent::Unavailable(error) => {
+                eprintln!("vanta-shell: application service unavailable: {error}");
+            }
+        }
+    }
+
+    fn handle_storage_event(&mut self, event: storage_worker::StorageEvent) {
+        match event {
+            storage_worker::StorageEvent::State(view) => {
+                let revision = view.revision;
+                let previous_revision = self.storage_view.as_ref().map(|old| old.revision);
+                self.storage_view = Some(view);
+
+                if previous_revision != Some(revision) {
+                    eprintln!("vanta-shell: storage state updated (revision {revision})");
+                }
+            }
+            storage_worker::StorageEvent::Unavailable(error) => {
+                eprintln!("vanta-shell: storage unavailable: {error}");
+            }
+        }
+    }
+
     fn handle_ipc_event(&mut self, event: ipc::IpcEvent) {
+        if self.workspace_sync_request_id == Some(event.request_id) {
+            self.workspace_sync_request_id = None;
+        }
+
         match event.result {
             Ok(response) => match response.result {
                 Some(ActionResult::Workspaces {
@@ -294,21 +662,23 @@ impl VantaShell {
                             }
 
                             if !self.dock_first_configure {
-                                self.draw_dock();
+                                let _ = self.draw_dock(false);
                             }
 
                             if self.quick_settings_layer.is_some() {
-                                self.draw_quick_settings();
+                                self.request_quick_settings_redraw();
                             }
                         }
                     }
                 }
 
                 Some(ActionResult::MinimizedWindows { windows }) => {
-                    self.minimized_windows = windows;
+                    if self.minimized_windows != windows {
+                        self.minimized_windows = windows;
 
-                    if !self.dock_first_configure {
-                        self.draw_dock();
+                        if !self.dock_first_configure {
+                            let _ = self.draw_dock(false);
+                        }
                     }
                 }
 
@@ -351,7 +721,7 @@ impl VantaShell {
             let mut frame =
                 render::primitives::Canvas::new(canvas, self.panel_width, self.panel_height);
 
-            frame.clear(render::theme::COLOR_PANEL);
+            frame.clear(self.theme.panel);
             render::panel::draw(
                 &mut frame,
                 &self.font_renderer,
@@ -360,6 +730,7 @@ impl VantaShell {
                 self.workspace_count,
                 self.active_workspace,
                 self.controls_hovered,
+                &self.theme,
             );
         }
 
@@ -367,13 +738,14 @@ impl VantaShell {
         surface.damage_buffer(0, 0, self.panel_width as i32, self.panel_height as i32);
         buffer.attach_to(surface).unwrap();
         layer.commit();
+        eprintln!("VANTA_APP_GRID: buffer attached and layer committed");
     }
 
-    fn draw_dock(&mut self) {
-        let Some(layer) = self.dock_layer.as_ref() else {
-            return;
-        };
+    fn draw_dock(&mut self, measure: bool) -> Option<[Duration; 8]> {
+        let layer = self.dock_layer.as_ref()?;
+        let pinned_applications = self.pinned_applications();
 
+        let buffer_started = measure.then(Instant::now);
         let stride = self.dock_width as i32 * 4;
         let (buffer, canvas) = self
             .dock_pool
@@ -384,27 +756,56 @@ impl VantaShell {
                 wl_shm::Format::Argb8888,
             )
             .expect("dock shm buffer");
+        let buffer_elapsed = buffer_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
 
-        {
-            let mut frame =
-                render::primitives::Canvas::new(canvas, self.dock_width, self.dock_height);
+        let clear_started = measure.then(Instant::now);
+        let mut frame = render::primitives::Canvas::new(canvas, self.dock_width, self.dock_height);
+        frame.clear(0x00000000);
+        let clear_elapsed = clear_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
 
-            frame.clear(0x00000000);
-            render::dock::draw(
-                &mut frame,
-                &self.font_renderer,
-                self.dock_width,
-                self.dock_height,
-                self.workspace_count,
-                self.active_workspace,
-                &self.minimized_windows,
-            );
-        }
+        let renderer_timings = render::dock::draw(
+            &mut frame,
+            &self.font_renderer,
+            self.dock_width,
+            self.dock_height,
+            self.workspace_count,
+            self.active_workspace,
+            &self.minimized_windows,
+            &pinned_applications,
+            &self.theme,
+            &mut self.dock_icon_cache,
+            &mut self.dock_background_cache,
+            measure,
+        );
+        drop(frame);
 
+        let submit_started = measure.then(Instant::now);
         let surface = layer.wl_surface();
         surface.damage_buffer(0, 0, self.dock_width as i32, self.dock_height as i32);
         buffer.attach_to(surface).unwrap();
         layer.commit();
+        let submit_elapsed = submit_started
+            .map(|started| started.elapsed())
+            .unwrap_or_default();
+
+        if measure {
+            Some([
+                buffer_elapsed,
+                clear_elapsed,
+                renderer_timings[0],
+                renderer_timings[1],
+                renderer_timings[2],
+                renderer_timings[3],
+                renderer_timings[4],
+                submit_elapsed,
+            ])
+        } else {
+            None
+        }
     }
 
     fn open_quick_settings(&mut self, qh: &QueueHandle<Self>) {
@@ -432,11 +833,16 @@ impl VantaShell {
         layer.set_size(self.quick_settings_width, self.quick_settings_height);
         layer.commit();
 
-        let pool_size =
-            self.quick_settings_width as usize * self.quick_settings_height as usize * 4;
+        // Keep the SHM pool alive across close/open cycles.
+        // SlotPool reuses released slots and grows automatically when needed.
+        if self.quick_settings_pool.is_none() {
+            let pool_size =
+                self.quick_settings_width as usize * self.quick_settings_height as usize * 4;
 
-        self.quick_settings_pool =
-            Some(SlotPool::new(pool_size, &self.shm).expect("quick settings shm pool"));
+            self.quick_settings_pool =
+                Some(SlotPool::new(pool_size, &self.shm).expect("quick settings shm pool"));
+        }
+
         self.quick_settings_first_configure = true;
         self.quick_settings_layer = Some(layer);
     }
@@ -447,18 +853,30 @@ impl VantaShell {
         }
 
         self.quick_settings_layer = None;
-        self.quick_settings_pool = None;
+        self.quick_settings_redraw_pending = false;
+        // Retain quick_settings_pool so reopening does not recreate SHM.
         self.quick_settings_first_configure = true;
+        self.quick_settings_expanded = render::quick_settings::ConnectivityPanel::None;
+        self.quick_settings_workspaces_hovered = false;
+        self.quick_settings_add_workspace_hovered = false;
+    }
+
+    fn request_quick_settings_redraw(&mut self) {
+        if self.quick_settings_layer.is_some() {
+            self.quick_settings_redraw_pending = true;
+        }
+    }
+
+    fn flush_quick_settings_redraw(&mut self) {
+        if !self.quick_settings_redraw_pending {
+            return;
+        }
+
+        self.quick_settings_redraw_pending = false;
+        self.draw_quick_settings();
     }
 
     fn draw_quick_settings(&mut self) {
-        eprintln!(
-            "VANTA_QS: draw requested; size={}x{}; layer_present={}",
-            self.quick_settings_width,
-            self.quick_settings_height,
-            self.quick_settings_layer.is_some()
-        );
-
         let Some(layer) = self.quick_settings_layer.as_ref() else {
             return;
         };
@@ -493,6 +911,10 @@ impl VantaShell {
                 self.workspace_count,
                 self.active_workspace,
                 &self.control_state,
+                &self.theme,
+                self.quick_settings_expanded,
+                self.quick_settings_workspaces_hovered,
+                self.quick_settings_add_workspace_hovered,
             );
         }
 
@@ -500,7 +922,246 @@ impl VantaShell {
         surface.damage_buffer(0, 0, width as i32, height as i32);
         buffer.attach_to(surface).unwrap();
         layer.commit();
-        eprintln!("VANTA_QS: buffer attached and layer committed");
+    }
+
+    fn open_application_grid(&mut self, qh: &QueueHandle<Self>) {
+        if self.application_grid_layer.is_some() {
+            return;
+        }
+
+        if self.quick_settings_layer.is_some() {
+            self.close_quick_settings();
+        }
+
+        self.application_grid_query.clear();
+        self.application_grid_selected = 0;
+        self.application_grid_keyboard_focused = false;
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("vanta-application-grid"),
+            None,
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_exclusive_zone(0);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::OnDemand);
+        layer.set_size(0, 0);
+        layer.commit();
+
+        if self.application_grid_pool.is_none() {
+            let size =
+                self.application_grid_width as usize * self.application_grid_height as usize * 4;
+            self.application_grid_pool =
+                Some(SlotPool::new(size, &self.shm).expect("application grid shm pool"));
+        }
+
+        self.application_grid_first_configure = true;
+        self.application_grid_layer = Some(layer);
+        self.request_application_grid_redraw();
+        eprintln!("vanta-shell: application grid opened");
+    }
+
+    fn close_application_grid(&mut self) {
+        self.application_grid_layer = None;
+        self.application_grid_redraw_pending = false;
+        self.application_grid_first_configure = true;
+        self.application_grid_keyboard_focused = false;
+        self.application_grid_query.clear();
+        self.application_grid_selected = 0;
+        eprintln!("vanta-shell: application grid closed");
+    }
+
+    fn request_application_grid_redraw(&mut self) {
+        if self.application_grid_layer.is_some() {
+            self.application_grid_redraw_pending = true;
+        }
+    }
+
+    fn flush_application_grid_redraw(&mut self) {
+        if !self.application_grid_redraw_pending {
+            return;
+        }
+        self.application_grid_redraw_pending = false;
+        self.draw_application_grid();
+    }
+
+    fn pinned_applications(&self) -> Vec<Application> {
+        self.dock_preferences
+            .pinned
+            .iter()
+            .filter_map(|id| {
+                self.applications
+                    .iter()
+                    .find(|app| app.id == *id && render::dock::is_dock_application(app))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    fn filtered_applications(&self) -> Vec<Application> {
+        let query = self.application_grid_query.trim().to_lowercase();
+        if query.is_empty() {
+            return self.applications.clone();
+        }
+
+        self.applications
+            .iter()
+            .filter(|application| {
+                application.name.to_lowercase().contains(&query)
+                    || application
+                        .generic_name
+                        .as_deref()
+                        .is_some_and(|value| value.to_lowercase().contains(&query))
+                    || application
+                        .comment
+                        .as_deref()
+                        .is_some_and(|value| value.to_lowercase().contains(&query))
+                    || application
+                        .categories
+                        .iter()
+                        .any(|value| value.to_lowercase().contains(&query))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn move_selected_pin(&mut self, delta: isize) {
+        let applications = self.filtered_applications();
+        let Some(application) = applications.get(self.application_grid_selected) else {
+            return;
+        };
+        let id = application.id.clone();
+
+        if self.dock_preferences.move_pin(&id, delta) {
+            if let Err(error) = self.dock_preferences.save() {
+                eprintln!("vanta-shell: failed to save dock order: {error}");
+            }
+            let _ = self.draw_dock(false);
+            self.request_application_grid_redraw();
+        }
+    }
+
+    fn toggle_selected_application_pin(&mut self) {
+        let applications = self.filtered_applications();
+        let Some(application) = applications.get(self.application_grid_selected) else {
+            return;
+        };
+
+        if !render::dock::is_dock_application(application) {
+            eprintln!(
+                "vanta-shell: application cannot be pinned: {}",
+                application.name
+            );
+            return;
+        }
+
+        let id = application.id.clone();
+        let pinned = self.dock_preferences.toggle(&id);
+        match self.dock_preferences.save() {
+            Ok(()) => eprintln!(
+                "vanta-shell: {} {}",
+                if pinned { "pinned" } else { "unpinned" },
+                id
+            ),
+            Err(error) => eprintln!("vanta-shell: failed to save dock preferences: {error}"),
+        }
+        let _ = self.draw_dock(false);
+        self.request_application_grid_redraw();
+    }
+
+    fn launch_grid_application(&mut self, index: usize) {
+        let applications = self.filtered_applications();
+        let Some(application) = applications.get(index).cloned() else {
+            return;
+        };
+        if application.terminal {
+            eprintln!(
+                "vanta-shell: {} requires Vanta Terminal; launch deferred",
+                application.name
+            );
+            return;
+        }
+        match self.application_worker.launch(application.id.clone()) {
+            Ok(()) => self.close_application_grid(),
+            Err(error) => eprintln!("vanta-shell: cannot queue {}: {error}", application.id),
+        }
+    }
+
+    fn draw_application_grid(&mut self) {
+        let Some(layer) = self.application_grid_layer.as_ref() else {
+            return;
+        };
+
+        let applications = self.filtered_applications();
+        eprintln!(
+            "VANTA_APP_GRID: draw requested apps={} query={:?} selected={}",
+            applications.len(),
+            self.application_grid_query,
+            self.application_grid_selected
+        );
+        if self.application_grid_selected >= applications.len() {
+            self.application_grid_selected = applications.len().saturating_sub(1);
+        }
+
+        let running_application_ids: Vec<String> = applications
+            .iter()
+            .filter(|application| {
+                application.startup_wm_class.as_ref().is_some_and(|class| {
+                    self.running_processes.iter().any(|process| {
+                        process
+                            .startup_wm_class
+                            .as_ref()
+                            .is_some_and(|running_class| running_class.eq_ignore_ascii_case(class))
+                    })
+                })
+            })
+            .map(|application| application.id.clone())
+            .collect();
+
+        let Some(pool) = self.application_grid_pool.as_mut() else {
+            return;
+        };
+
+        let width = self.application_grid_width;
+        let height = self.application_grid_height;
+        eprintln!("VANTA_APP_GRID: buffer dimensions={}x{}", width, height);
+        if width == 0 || height == 0 {
+            return;
+        }
+
+        let stride = width as i32 * 4;
+        let (buffer, canvas) = pool
+            .create_buffer(
+                width as i32,
+                height as i32,
+                stride,
+                wl_shm::Format::Argb8888,
+            )
+            .expect("application grid shm buffer");
+
+        {
+            let mut frame = render::primitives::Canvas::new(canvas, width, height);
+            frame.clear(0x00000000);
+            render::app_grid::draw(
+                &mut frame,
+                &self.font_renderer,
+                width,
+                height,
+                &applications,
+                self.application_grid_selected,
+                &running_application_ids,
+                &self.dock_preferences.pinned,
+                &self.application_grid_query,
+            );
+        }
+
+        let surface = layer.wl_surface();
+        surface.damage_buffer(0, 0, width as i32, height as i32);
+        buffer.attach_to(surface).unwrap();
+        layer.commit();
     }
 }
 
@@ -541,13 +1202,19 @@ impl CompositorHandler for VantaShell {
             .as_ref()
             .is_some_and(|layer| surface == layer.wl_surface())
         {
-            self.draw_dock();
+            let _ = self.draw_dock(false);
         } else if self
             .quick_settings_layer
             .as_ref()
             .is_some_and(|layer| surface == layer.wl_surface())
         {
-            self.draw_quick_settings();
+            self.request_quick_settings_redraw();
+        } else if self
+            .application_grid_layer
+            .as_ref()
+            .is_some_and(|layer| surface == layer.wl_surface())
+        {
+            self.request_application_grid_redraw();
         }
     }
 
@@ -616,6 +1283,16 @@ impl SeatHandler for VantaShell {
                 Err(error) => eprintln!("VANTA_INPUT: pointer registration failed: {error}"),
             }
         }
+
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            match self.seat_state.get_keyboard(qh, &seat, None) {
+                Ok(keyboard) => {
+                    eprintln!("VANTA_INPUT: keyboard successfully registered");
+                    self.keyboard = Some(keyboard);
+                }
+                Err(error) => eprintln!("VANTA_INPUT: keyboard registration failed: {error}"),
+            }
+        }
     }
 
     fn remove_capability(
@@ -633,9 +1310,162 @@ impl SeatHandler for VantaShell {
                 eprintln!("VANTA_INPUT: pointer released");
             }
         }
+
+        if capability == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
+                eprintln!("VANTA_INPUT: keyboard released");
+            }
+        }
     }
 
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for VantaShell {
+    fn enter(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+        _: &[u32],
+        _: &[smithay_client_toolkit::seat::keyboard::Keysym],
+    ) {
+        self.application_grid_keyboard_focused = self
+            .application_grid_layer
+            .as_ref()
+            .is_some_and(|layer| surface == layer.wl_surface());
+        eprintln!("VANTA_INPUT: keyboard focus entered shell surface");
+    }
+
+    fn leave(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if self
+            .application_grid_layer
+            .as_ref()
+            .is_some_and(|layer| surface == layer.wl_surface())
+        {
+            self.application_grid_keyboard_focused = false;
+        }
+        eprintln!("VANTA_INPUT: keyboard focus left shell surface");
+    }
+
+    fn press_key(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        event: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+        if !self.application_grid_keyboard_focused || self.application_grid_layer.is_none() {
+            return;
+        }
+
+        use smithay_client_toolkit::seat::keyboard::Keysym;
+        let count = self.filtered_applications().len().min(16);
+        let columns = 4usize;
+
+        if self.keyboard_modifiers.ctrl {
+            match event.keysym {
+                Keysym::p | Keysym::P => {
+                    self.toggle_selected_application_pin();
+                    return;
+                }
+                Keysym::Left => {
+                    self.move_selected_pin(-1);
+                    return;
+                }
+                Keysym::Right => {
+                    self.move_selected_pin(1);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        match event.keysym {
+            Keysym::Escape => self.close_application_grid(),
+            Keysym::BackSpace => {
+                self.application_grid_query.pop();
+                self.application_grid_selected = 0;
+                self.request_application_grid_redraw();
+            }
+            Keysym::Return => self.launch_grid_application(self.application_grid_selected),
+            Keysym::Left if count > 0 => {
+                self.application_grid_selected = self.application_grid_selected.saturating_sub(1);
+                self.request_application_grid_redraw();
+            }
+            Keysym::Right if count > 0 => {
+                self.application_grid_selected =
+                    (self.application_grid_selected + 1).min(count - 1);
+                self.request_application_grid_redraw();
+            }
+            Keysym::Up if count > 0 => {
+                self.application_grid_selected =
+                    self.application_grid_selected.saturating_sub(columns);
+                self.request_application_grid_redraw();
+            }
+            Keysym::Down if count > 0 => {
+                self.application_grid_selected =
+                    (self.application_grid_selected + columns).min(count - 1);
+                self.request_application_grid_redraw();
+            }
+            _ => {
+                if let Some(text) = event.utf8.as_deref() {
+                    let printable: String = text.chars().filter(|ch| !ch.is_control()).collect();
+                    if !printable.is_empty()
+                        && self.application_grid_query.len() + printable.len() <= 96
+                    {
+                        self.application_grid_query.push_str(&printable);
+                        self.application_grid_selected = 0;
+                        self.request_application_grid_redraw();
+                    }
+                }
+            }
+        }
+    }
+
+    fn repeat_key(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+    }
+
+    fn release_key(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        _: smithay_client_toolkit::seat::keyboard::KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _: &wayland_client::Connection,
+        _: &wayland_client::QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: smithay_client_toolkit::seat::keyboard::Modifiers,
+        _: smithay_client_toolkit::seat::keyboard::RawModifiers,
+        _: u32,
+    ) {
+        self.keyboard_modifiers = modifiers;
+    }
 }
 
 impl PointerHandler for VantaShell {
@@ -666,7 +1496,6 @@ impl PointerHandler for VantaShell {
                     }
                     PointerEventKind::Leave { .. } => {
                         self.controls_hovered = false;
-                        self.draw_panel();
                     }
                     _ => {}
                 }
@@ -709,6 +1538,61 @@ impl PointerHandler for VantaShell {
             let (x, y) = event.position;
 
             if is_quick_settings_surface {
+                let (next_workspaces_hovered, next_add_hovered) = match &event.kind {
+                    PointerEventKind::Enter { .. } | PointerEventKind::Motion { .. } => {
+                        if self.quick_settings_expanded
+                            == render::quick_settings::ConnectivityPanel::None
+                        {
+                            let workspace_left = if self.quick_settings_workspaces_hovered {
+                                176.0
+                            } else {
+                                212.0
+                            };
+                            let add_left = if self.quick_settings_add_workspace_hovered {
+                                254.0
+                            } else {
+                                282.0
+                            };
+
+                            (
+                                (workspace_left
+                                    ..workspace_left
+                                        + if self.quick_settings_workspaces_hovered {
+                                            72.0
+                                        } else {
+                                            36.0
+                                        })
+                                    .contains(&x)
+                                    && (14.0..44.0).contains(&y),
+                                (add_left
+                                    ..add_left
+                                        + if self.quick_settings_add_workspace_hovered {
+                                            64.0
+                                        } else {
+                                            36.0
+                                        })
+                                    .contains(&x)
+                                    && (14.0..44.0).contains(&y),
+                            )
+                        } else {
+                            (false, false)
+                        }
+                    }
+                    PointerEventKind::Leave { .. } => (false, false),
+                    _ => (
+                        self.quick_settings_workspaces_hovered,
+                        self.quick_settings_add_workspace_hovered,
+                    ),
+                };
+
+                if next_workspaces_hovered != self.quick_settings_workspaces_hovered
+                    || next_add_hovered != self.quick_settings_add_workspace_hovered
+                {
+                    self.quick_settings_workspaces_hovered = next_workspaces_hovered;
+                    self.quick_settings_add_workspace_hovered = next_add_hovered;
+                    self.request_quick_settings_redraw();
+                }
+
                 match &event.kind {
                     PointerEventKind::Press {
                         button: BTN_LEFT, ..
@@ -719,11 +1603,25 @@ impl PointerHandler for VantaShell {
                             x,
                             y,
                             self.workspace_count,
+                            self.quick_settings_expanded,
+                            &self.control_state,
+                            self.quick_settings_workspaces_hovered,
+                            self.quick_settings_add_workspace_hovered,
                         ) {
-                            Some(render::quick_settings::ControlAction::SetVolumePercent(_)) => {
+                            Some(
+                                render::quick_settings::ControlAction::SetVolumePercent(_)
+                                | render::quick_settings::ControlAction::SetSystemVolumePercent(_),
+                            ) => {
                                 self.volume_slider_dragging = true;
                                 self.last_volume_slider_percent = None;
                                 self.update_volume_slider(x);
+                            }
+                            Some(
+                                render::quick_settings::ControlAction::SetOutputVolumePercent(_),
+                            ) => {
+                                self.output_volume_slider_dragging = true;
+                                self.last_output_volume_slider_percent = None;
+                                self.update_output_volume_slider(x);
                             }
                             Some(render::quick_settings::ControlAction::SetBrightnessPercent(
                                 _,
@@ -737,6 +1635,9 @@ impl PointerHandler for VantaShell {
                     }
                     PointerEventKind::Motion { .. } if self.volume_slider_dragging => {
                         self.update_volume_slider(x);
+                    }
+                    PointerEventKind::Motion { .. } if self.output_volume_slider_dragging => {
+                        self.update_output_volume_slider(x);
                     }
                     PointerEventKind::Motion { .. } if self.brightness_slider_dragging => {
                         self.update_brightness_slider(x);
@@ -764,6 +1665,8 @@ impl PointerHandler for VantaShell {
 
                 self.volume_slider_dragging = false;
                 self.last_volume_slider_percent = None;
+                self.output_volume_slider_dragging = false;
+                self.last_output_volume_slider_percent = None;
                 self.brightness_slider_dragging = false;
                 self.last_brightness_slider_percent = None;
             }
@@ -774,6 +1677,37 @@ impl PointerHandler for VantaShell {
             else {
                 continue;
             };
+
+            // Application grid overlay.
+            if self
+                .application_grid_layer
+                .as_ref()
+                .is_some_and(|layer| &event.surface == layer.wl_surface())
+            {
+                if !render::app_grid::point_inside_panel(
+                    self.application_grid_width,
+                    self.application_grid_height,
+                    x,
+                    y,
+                ) {
+                    self.close_application_grid();
+                } else {
+                    let applications = self.filtered_applications();
+                    if let Some(index) = render::app_grid::application_at(
+                        self.application_grid_width,
+                        self.application_grid_height,
+                        applications.len(),
+                        x,
+                        y,
+                    ) {
+                        if index < 16 {
+                            self.application_grid_selected = index;
+                            self.launch_grid_application(index);
+                        }
+                    }
+                }
+                continue;
+            }
 
             // Quick Settings controls.
             if self
@@ -787,9 +1721,20 @@ impl PointerHandler for VantaShell {
                     x,
                     y,
                     self.workspace_count,
+                    self.quick_settings_expanded,
+                    &self.control_state,
+                    self.quick_settings_workspaces_hovered,
+                    self.quick_settings_add_workspace_hovered,
                 ) {
                     Some(render::quick_settings::ControlAction::Close) => {
                         self.close_quick_settings();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenWorkspaces) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Workspaces;
+                        self.quick_settings_workspaces_hovered = false;
+                        self.quick_settings_add_workspace_hovered = false;
+                        self.request_quick_settings_redraw();
                     }
                     Some(render::quick_settings::ControlAction::SwitchWorkspace(index)) => {
                         if index != self.active_workspace {
@@ -799,22 +1744,83 @@ impl PointerHandler for VantaShell {
                                 eprintln!("vanta-shell: workspace switch request failed: {error}");
                             }
                         }
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::None;
+                        self.request_quick_settings_redraw();
                     }
                     Some(render::quick_settings::ControlAction::CreateWorkspace) => {
                         if let Err(error) = self.ipc_client.request(Action::CreateWorkspace) {
                             eprintln!("vanta-shell: workspace creation request failed: {error}");
                         }
                     }
+                    Some(render::quick_settings::ControlAction::OpenWifiDetails) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Wifi;
+                        if let Err(error) = self.control_worker.refresh_connectivity() {
+                            eprintln!("vanta-shell: cannot queue Wi-Fi discovery: {error}");
+                        }
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenBluetoothDetails) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Bluetooth;
+                        if let Err(error) = self.control_worker.refresh_connectivity() {
+                            eprintln!("vanta-shell: cannot queue Bluetooth discovery: {error}");
+                        }
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenSound) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Sound;
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenBrightness) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Brightness;
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenAppearance) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Appearance;
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::OpenKeyboardBacklight) => {
+                        if self.control_state.keyboard_backlight.is_some() {
+                            self.quick_settings_expanded =
+                                render::quick_settings::ConnectivityPanel::KeyboardBacklight;
+                            self.request_quick_settings_redraw();
+                        }
+                    }
+                    Some(render::quick_settings::ControlAction::OpenPower) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::Power;
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::BackToControls) => {
+                        self.quick_settings_expanded =
+                            render::quick_settings::ConnectivityPanel::None;
+                        self.request_quick_settings_redraw();
+                    }
+                    Some(render::quick_settings::ControlAction::RefreshConnectivity) => {
+                        if let Err(error) = self.control_worker.refresh_connectivity() {
+                            eprintln!("vanta-shell: cannot queue connectivity refresh: {error}");
+                        }
+                    }
                     Some(render::quick_settings::ControlAction::SetVolumePercent(_))
+                    | Some(render::quick_settings::ControlAction::SetSystemVolumePercent(_))
+                    | Some(render::quick_settings::ControlAction::SetOutputVolumePercent(_))
                     | Some(render::quick_settings::ControlAction::SetBrightnessPercent(_)) => {}
                     Some(
                         action @ (render::quick_settings::ControlAction::ToggleWifi
                         | render::quick_settings::ControlAction::ToggleBluetooth
-                        | render::quick_settings::ControlAction::ToggleMute),
+                        | render::quick_settings::ControlAction::ToggleMute
+                        | render::quick_settings::ControlAction::SetSystemVolumePercent(_)
+                        | render::quick_settings::ControlAction::SetOutputVolumePercent(_)
+                        | render::quick_settings::ControlAction::SetKeyboardBacklight(_)),
                     ) => {
                         // Update the visible control in this event cycle.
                         self.control_state.apply_optimistic(action);
-                        self.draw_quick_settings();
+                        self.request_quick_settings_redraw();
 
                         if let Err(error) = self.control_worker.perform(action) {
                             eprintln!("vanta-shell: cannot queue Controls action: {error}");
@@ -851,11 +1857,40 @@ impl PointerHandler for VantaShell {
                 continue;
             }
 
+            // Launch an installed application from its dock slot.
+            let pinned_applications = self.pinned_applications();
+            if let Some(index) =
+                render::dock::dock_application_at(x, y, &pinned_applications, self.dock_width)
+            {
+                if let Some(application) = pinned_applications.get(index) {
+                    let application_id = application.id.clone();
+
+                    if let Err(error) = self.application_worker.launch(application_id.clone()) {
+                        eprintln!(
+                            "vanta-shell: cannot queue dock application {application_id}: {error}"
+                        );
+                    }
+                }
+
+                continue;
+            }
+
+            // Application-grid launcher icon.
+            if render::dock::application_grid_icon_at(x, y, &pinned_applications, self.dock_width) {
+                if self.application_grid_layer.is_some() {
+                    self.close_application_grid();
+                } else {
+                    self.open_application_grid(qh);
+                }
+                continue;
+            }
+
             // Only process clicks below this point.
             if let Some(id) = render::dock::minimized_window_at(
                 self.dock_width,
                 self.dock_height,
                 &self.minimized_windows,
+                &self.applications,
                 x,
                 y,
             ) {
@@ -872,6 +1907,7 @@ impl PointerHandler for VantaShell {
                 self.dock_width,
                 self.dock_height,
                 self.workspace_count,
+                &self.applications,
                 x,
                 y,
             ) {
@@ -908,6 +1944,13 @@ impl LayerShellHandler for VantaShell {
         {
             self.close_quick_settings();
             eprintln!("vanta-shell: quick settings surface closed");
+        } else if self
+            .application_grid_layer
+            .as_ref()
+            .is_some_and(|current| current == layer)
+        {
+            self.close_application_grid();
+            eprintln!("vanta-shell: application grid surface closed");
         }
     }
 
@@ -987,37 +2030,84 @@ impl LayerShellHandler for VantaShell {
 
             if should_draw {
                 self.dock_first_configure = false;
-                self.draw_dock();
+                let _ = self.draw_dock(false);
             }
         } else if self
             .quick_settings_layer
             .as_ref()
             .is_some_and(|current| current == layer)
         {
-            eprintln!("VANTA_QS: configure matched quick-settings layer");
+            let requested_size = (self.quick_settings_width, self.quick_settings_height);
+
+            // A newly mapped layer can receive a transient configure based on
+            // Smithay's pre-commit default state (for example, 640x400).
+            // Do not render that intermediate size. Wait for the configure
+            // matching the dimensions requested when the layer was created.
+            let configured_size = (
+                NonZeroU32::new(suggested_width)
+                    .map(NonZeroU32::get)
+                    .unwrap_or(requested_size.0),
+                NonZeroU32::new(suggested_height)
+                    .map(NonZeroU32::get)
+                    .unwrap_or(requested_size.1),
+            );
+
+            if self.quick_settings_first_configure && configured_size != requested_size {
+                eprintln!(
+                    "VANTA_QS: deferring transient configure {}x{}; waiting for {}x{}",
+                    configured_size.0, configured_size.1, requested_size.0, requested_size.1
+                );
+                return;
+            }
 
             let old_size = (self.quick_settings_width, self.quick_settings_height);
+            self.quick_settings_width = configured_size.0;
+            self.quick_settings_height = configured_size.1;
 
-            if let Some(width) = NonZeroU32::new(suggested_width) {
-                self.quick_settings_width = width.get();
-            }
-            if let Some(height) = NonZeroU32::new(suggested_height) {
-                self.quick_settings_height = height.get();
-            }
-
-            let size_changed = old_size != (self.quick_settings_width, self.quick_settings_height);
+            let size_changed = old_size != configured_size;
 
             if size_changed {
                 let pool_size =
                     self.quick_settings_width as usize * self.quick_settings_height as usize * 4;
-                self.quick_settings_pool = Some(
-                    SlotPool::new(pool_size, &self.shm).expect("resized quick settings shm pool"),
-                );
+
+                if let Some(pool) = self.quick_settings_pool.as_mut() {
+                    pool.resize(pool_size)
+                        .expect("resize quick settings shm pool");
+                }
             }
 
             if self.quick_settings_first_configure || size_changed {
                 self.quick_settings_first_configure = false;
-                self.draw_quick_settings();
+                self.request_quick_settings_redraw();
+            }
+        } else if self
+            .application_grid_layer
+            .as_ref()
+            .is_some_and(|current| current == layer)
+        {
+            let old_size = (self.application_grid_width, self.application_grid_height);
+            self.application_grid_width = NonZeroU32::new(suggested_width)
+                .map(NonZeroU32::get)
+                .unwrap_or(old_size.0);
+            self.application_grid_height = NonZeroU32::new(suggested_height)
+                .map(NonZeroU32::get)
+                .unwrap_or(old_size.1);
+
+            let size_changed =
+                old_size != (self.application_grid_width, self.application_grid_height);
+            if size_changed {
+                let pool_size = self.application_grid_width as usize
+                    * self.application_grid_height as usize
+                    * 4;
+                if let Some(pool) = self.application_grid_pool.as_mut() {
+                    pool.resize(pool_size)
+                        .expect("resize application grid shm pool");
+                }
+            }
+
+            if self.application_grid_first_configure || size_changed {
+                self.application_grid_first_configure = false;
+                self.request_application_grid_redraw();
             }
         }
     }
