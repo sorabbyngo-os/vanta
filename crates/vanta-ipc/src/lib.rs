@@ -11,14 +11,28 @@ pub enum LayoutMode {
     /// Persistent adaptive split-tree tiling. This is the fresh-install default.
     #[default]
     Adaptive,
+    /// User-controlled split topology with editable orientation.
+    Manual,
+    /// User-controlled split topology with arbitrary proportions.
+    Fractional,
     /// Independent, overlapping windows.
     Floating,
     /// One master window with supporting windows in a stack.
     MasterStack,
 }
 
+/// Orientation of a user-controlled workspace split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SplitAxis {
+    /// First child on the left, second child on the right.
+    LeftRight,
+    /// First child on top, second child on the bottom.
+    TopBottom,
+}
+
 /// A request sent to the Vanta compositor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
     pub protocol_version: u16,
     pub request_id: u64,
@@ -95,7 +109,7 @@ pub struct Response {
     pub result: Option<ActionResult>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Action {
     FocusWindow {
         id: u64,
@@ -122,6 +136,24 @@ pub enum Action {
     GetLayoutMode,
     SetLayoutMode {
         mode: LayoutMode,
+    },
+    /// Explicitly place a pending window beside an existing leaf.
+    /// `ratio` describes the existing target's first-child proportion.
+    InsertWindowInLayout {
+        id: u64,
+        target_id: u64,
+        axis: SplitAxis,
+        ratio: f64,
+    },
+    /// Set the ratio of the split enclosing the selected window.
+    SetSplitRatio {
+        window_id: u64,
+        ratio: f64,
+    },
+    /// Change the orientation of the split enclosing the selected window.
+    SetSplitAxis {
+        window_id: u64,
+        axis: SplitAxis,
     },
 
     /// Intent path — executed only after AION mediation.
@@ -276,6 +308,26 @@ mod action_tests {
             Action::GetLayoutMode,
             Action::SetLayoutMode {
                 mode: LayoutMode::MasterStack,
+            },
+            Action::SetLayoutMode {
+                mode: LayoutMode::Manual,
+            },
+            Action::SetLayoutMode {
+                mode: LayoutMode::Fractional,
+            },
+            Action::InsertWindowInLayout {
+                id: 10,
+                target_id: 4,
+                axis: SplitAxis::LeftRight,
+                ratio: 0.65,
+            },
+            Action::SetSplitRatio {
+                window_id: 4,
+                ratio: 0.72,
+            },
+            Action::SetSplitAxis {
+                window_id: 4,
+                axis: SplitAxis::TopBottom,
             },
             Action::RequestIntent {
                 text: "Open workspace two".to_owned(),

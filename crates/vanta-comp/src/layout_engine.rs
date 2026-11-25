@@ -3,6 +3,8 @@
 //! This module deliberately has no Smithay or compositor dependencies.
 //! It owns persistent window topology and calculates logical rectangles.
 
+use vanta_ipc::SplitAxis;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
     pub x: i32,
@@ -44,12 +46,6 @@ pub struct Placement {
     pub rect: Rect,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SplitAxis {
-    LeftRight,
-    TopBottom,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 enum Node {
     Leaf(u64),
@@ -69,8 +65,17 @@ pub struct SplitTree {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutError {
     DuplicateWindow(u64),
+    WindowNotFound(u64),
+    NoSplitForWindow(u64),
+    InvalidRatio,
     InvalidBounds,
     InsufficientSpace,
+}
+
+/// Split proportions must leave positive space for both children.
+#[inline]
+fn is_valid_split_ratio(ratio: f64) -> bool {
+    ratio.is_finite() && ratio > 0.0 && ratio < 1.0
 }
 
 impl SplitTree {
@@ -102,6 +107,185 @@ impl SplitTree {
         }
 
         self.root.as_ref().is_some_and(|root| find(root, window_id))
+    }
+
+    /// Set the ratio of the split immediately enclosing `window_id`.
+    ///
+    /// The ratio represents the fraction assigned to the split's first child.
+    /// The operation is transactional and preserves the original tree if the
+    /// resulting geometry violates minimum window sizes.
+    pub fn set_split_ratio(
+        &mut self,
+        window_id: u64,
+        ratio: f64,
+        bounds: Rect,
+        gap: i32,
+        min_size: MinSize,
+    ) -> Result<(), LayoutError> {
+        if !is_valid_split_ratio(ratio) {
+            return Err(LayoutError::InvalidRatio);
+        }
+
+        if !self.contains(window_id) {
+            return Err(LayoutError::WindowNotFound(window_id));
+        }
+
+        // Validate the existing layout before modifying its topology.
+        self.layout(bounds, gap, min_size)?;
+
+        fn update_parent_ratio(node: &mut Node, target_id: u64, ratio: f64) -> bool {
+            let Node::Split {
+                ratio: current_ratio,
+                first,
+                second,
+                ..
+            } = node
+            else {
+                return false;
+            };
+
+            if matches!(first.as_ref(), Node::Leaf(id) if *id == target_id)
+                || matches!(second.as_ref(), Node::Leaf(id) if *id == target_id)
+            {
+                *current_ratio = ratio;
+                return true;
+            }
+
+            update_parent_ratio(first, target_id, ratio)
+                || update_parent_ratio(second, target_id, ratio)
+        }
+
+        let previous = self
+            .root
+            .clone()
+            .expect("tree contains the requested window");
+
+        let updated = update_parent_ratio(
+            self.root
+                .as_mut()
+                .expect("tree contains the requested window"),
+            window_id,
+            ratio,
+        );
+
+        if !updated {
+            return Err(LayoutError::NoSplitForWindow(window_id));
+        }
+
+        if let Err(error) = self.layout(bounds, gap, min_size) {
+            self.root = Some(previous);
+            return Err(error);
+        }
+
+        Ok(())
+    }
+
+    /// Insert a window by explicitly splitting an existing leaf.
+    ///
+    /// `ratio` is the fraction assigned to the existing target window.
+    /// The new window becomes the second child. Unlike automatic insertion,
+    /// this operation never changes the requested axis.
+    pub fn insert_with_ratio(
+        &mut self,
+        window_id: u64,
+        target_window: u64,
+        axis: SplitAxis,
+        ratio: f64,
+        bounds: Rect,
+        gap: i32,
+        min_size: MinSize,
+    ) -> Result<(), LayoutError> {
+        if !is_valid_split_ratio(ratio) {
+            return Err(LayoutError::InvalidRatio);
+        }
+
+        if self.contains(window_id) {
+            return Err(LayoutError::DuplicateWindow(window_id));
+        }
+
+        if !bounds.is_valid() {
+            return Err(LayoutError::InvalidBounds);
+        }
+
+        if !self.contains(target_window) {
+            return Err(LayoutError::WindowNotFound(target_window));
+        }
+
+        self.layout(bounds, gap, min_size)?;
+
+        let mut candidate = self.clone();
+        let replaced = Self::split_leaf_with_ratio(
+            candidate.root.as_mut().expect("target exists in tree"),
+            target_window,
+            window_id,
+            axis,
+            ratio,
+        );
+
+        if !replaced {
+            return Err(LayoutError::WindowNotFound(target_window));
+        }
+
+        candidate.layout(bounds, gap, min_size)?;
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Change the orientation of the split immediately enclosing a window.
+    ///
+    /// The operation is transactional: if the new orientation cannot satisfy
+    /// the current minimum sizes, the original tree remains unchanged.
+    pub fn set_split_axis(
+        &mut self,
+        window_id: u64,
+        axis: SplitAxis,
+        bounds: Rect,
+        gap: i32,
+        min_size: MinSize,
+    ) -> Result<(), LayoutError> {
+        if !self.contains(window_id) {
+            return Err(LayoutError::WindowNotFound(window_id));
+        }
+
+        self.layout(bounds, gap, min_size)?;
+
+        let mut candidate = self.clone();
+
+        fn update_parent_axis(node: &mut Node, target_id: u64, axis: SplitAxis) -> bool {
+            let Node::Split {
+                axis: current_axis,
+                first,
+                second,
+                ..
+            } = node
+            else {
+                return false;
+            };
+
+            if matches!(first.as_ref(), Node::Leaf(id) if *id == target_id)
+                || matches!(second.as_ref(), Node::Leaf(id) if *id == target_id)
+            {
+                *current_axis = axis;
+                return true;
+            }
+
+            update_parent_axis(first, target_id, axis)
+                || update_parent_axis(second, target_id, axis)
+        }
+
+        let updated = update_parent_axis(
+            candidate.root.as_mut().expect("tree contains the window"),
+            window_id,
+            axis,
+        );
+
+        if !updated {
+            return Err(LayoutError::NoSplitForWindow(window_id));
+        }
+
+        candidate.layout(bounds, gap, min_size)?;
+        *self = candidate;
+        Ok(())
     }
 
     /// Insert a window by splitting the focused leaf.
@@ -427,6 +611,32 @@ impl SplitTree {
         self.root.as_ref().map(last)
     }
 
+    fn split_leaf_with_ratio(
+        node: &mut Node,
+        target_id: u64,
+        new_id: u64,
+        axis: SplitAxis,
+        ratio: f64,
+    ) -> bool {
+        match node {
+            Node::Leaf(id) if *id == target_id => {
+                let old_id = *id;
+                *node = Node::Split {
+                    axis,
+                    ratio,
+                    first: Box::new(Node::Leaf(old_id)),
+                    second: Box::new(Node::Leaf(new_id)),
+                };
+                true
+            }
+            Node::Leaf(_) => false,
+            Node::Split { first, second, .. } => {
+                Self::split_leaf_with_ratio(first, target_id, new_id, axis, ratio)
+                    || Self::split_leaf_with_ratio(second, target_id, new_id, axis, ratio)
+            }
+        }
+    }
+
     fn split_leaf(node: &mut Node, target_id: u64, new_id: u64, axis: SplitAxis) -> bool {
         match node {
             Node::Leaf(id) if *id == target_id => {
@@ -740,5 +950,159 @@ mod tests {
         assert!(placements.iter().all(|placement| {
             placement.rect.width >= MIN_SIZE.width && placement.rect.height >= MIN_SIZE.height
         }));
+    }
+    #[test]
+    fn split_ratio_changes_first_child_proportion() {
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, BOUNDS, GAP, MIN_SIZE).unwrap();
+        tree.insert(2, Some(1), BOUNDS, GAP, MIN_SIZE).unwrap();
+
+        tree.set_split_ratio(1, 0.65, BOUNDS, GAP, MIN_SIZE)
+            .unwrap();
+
+        let result = rects(&tree);
+
+        assert_eq!(result[0].rect, Rect::new(0, 0, 1240, 1080));
+        assert_eq!(result[1].rect, Rect::new(1252, 0, 668, 1080));
+    }
+
+    #[test]
+    fn invalid_split_ratio_is_rejected_without_mutation() {
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, BOUNDS, GAP, MIN_SIZE).unwrap();
+        tree.insert(2, Some(1), BOUNDS, GAP, MIN_SIZE).unwrap();
+
+        let before = tree.clone();
+
+        assert_eq!(
+            tree.set_split_ratio(1, f64::NAN, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::InvalidRatio)
+        );
+
+        assert_eq!(
+            tree.set_split_ratio(1, 1.0, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::InvalidRatio)
+        );
+        assert_eq!(
+            tree.set_split_ratio(1, 0.0, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::InvalidRatio)
+        );
+
+        assert_eq!(
+            tree.set_split_ratio(1, -0.1, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::InvalidRatio)
+        );
+
+        assert_eq!(
+            tree.set_split_ratio(1, f64::INFINITY, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::InvalidRatio)
+        );
+
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn split_ratio_requires_an_existing_split() {
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, BOUNDS, GAP, MIN_SIZE).unwrap();
+
+        assert_eq!(
+            tree.set_split_ratio(1, 0.6, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::NoSplitForWindow(1))
+        );
+
+        assert_eq!(
+            tree.set_split_ratio(99, 0.6, BOUNDS, GAP, MIN_SIZE),
+            Err(LayoutError::WindowNotFound(99))
+        );
+    }
+    #[test]
+    fn explicit_insert_uses_requested_fractional_ratio() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, bounds, gap, min_size).unwrap();
+        tree.insert_with_ratio(2, 1, SplitAxis::LeftRight, 0.65, bounds, gap, min_size)
+            .unwrap();
+
+        let placements = tree.layout(bounds, gap, min_size).unwrap();
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].window_id, 1);
+        assert_eq!(placements[1].window_id, 2);
+        assert_eq!(placements[0].rect.width, 1240);
+    }
+
+    #[test]
+    fn explicit_insert_supports_nested_splits() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, bounds, gap, min_size).unwrap();
+        tree.insert_with_ratio(2, 1, SplitAxis::LeftRight, 0.65, bounds, gap, min_size)
+            .unwrap();
+        tree.insert_with_ratio(3, 2, SplitAxis::TopBottom, 0.60, bounds, gap, min_size)
+            .unwrap();
+
+        assert_eq!(tree.len(), 3);
+        assert_eq!(tree.layout(bounds, gap, min_size).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn changing_split_axis_updates_child_geometry() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, bounds, gap, min_size).unwrap();
+        tree.insert_with_ratio(2, 1, SplitAxis::LeftRight, 0.5, bounds, gap, min_size)
+            .unwrap();
+
+        tree.set_split_axis(2, SplitAxis::TopBottom, bounds, gap, min_size)
+            .unwrap();
+
+        let placements = tree.layout(bounds, gap, min_size).unwrap();
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].rect.width, bounds.width);
+        assert!(placements[0].rect.height < bounds.height);
+    }
+
+    #[test]
+    fn invalid_explicit_insert_preserves_tree() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, bounds, gap, min_size).unwrap();
+        let before = tree.clone();
+
+        assert_eq!(
+            tree.insert_with_ratio(2, 1, SplitAxis::LeftRight, 1.5, bounds, gap, min_size),
+            Err(LayoutError::InvalidRatio)
+        );
+        assert_eq!(tree, before);
+    }
+
+    #[test]
+    fn changing_axis_without_parent_split_is_rejected() {
+        let bounds = Rect::new(0, 0, 1920, 1080);
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+        let mut tree = SplitTree::new();
+
+        tree.insert(1, None, bounds, gap, min_size).unwrap();
+
+        assert_eq!(
+            tree.set_split_axis(1, SplitAxis::TopBottom, bounds, gap, min_size),
+            Err(LayoutError::NoSplitForWindow(1))
+        );
     }
 }

@@ -217,22 +217,15 @@ pub(crate) fn set_window_maximized_protocol_state(window: &Window, maximized: bo
 
 impl Vanta {
     /// Restore a window's geometry saved before it was maximized.
-    fn restore_window_geometry(
-        &mut self,
-        id: u64,
-        rect: Rectangle<i32, Logical>,
-    ) {
+    fn restore_window_geometry(&mut self, id: u64, rect: Rectangle<i32, Logical>) {
         let Some(window) = self.windows.get(&id).cloned() else {
             return;
         };
 
         self.space.map_element(window.clone(), rect.loc, true);
         self.window_locations.insert(id, rect.loc);
-        self.motion.snap_window_position(
-            id,
-            f64::from(rect.loc.x),
-            f64::from(rect.loc.y),
-        );
+        self.motion
+            .snap_window_position(id, f64::from(rect.loc.x), f64::from(rect.loc.y));
 
         if let Some(toplevel) = window.toplevel().filter(|surface| surface.alive()) {
             toplevel.with_pending_state(|state| {
@@ -287,10 +280,8 @@ impl Vanta {
         if target == SnapTarget::Maximize {
             if !self.maximize_restore_rects.contains_key(&id) {
                 if let Some(location) = self.space.element_location(&window) {
-                    self.maximize_restore_rects.insert(
-                        id,
-                        Rectangle::new(location, window.geometry().size),
-                    );
+                    self.maximize_restore_rects
+                        .insert(id, Rectangle::new(location, window.geometry().size));
                 }
             }
         } else {
@@ -303,11 +294,8 @@ impl Vanta {
 
         self.space.map_element(window.clone(), rect.loc, true);
         self.window_locations.insert(id, rect.loc);
-        self.motion.snap_window_position(
-            id,
-            f64::from(rect.loc.x),
-            f64::from(rect.loc.y),
-        );
+        self.motion
+            .snap_window_position(id, f64::from(rect.loc.x), f64::from(rect.loc.y));
 
         if let Some(toplevel) = window.toplevel().filter(|surface| surface.alive()) {
             toplevel.with_pending_state(|state| {
@@ -356,8 +344,16 @@ impl Vanta {
 
         self.clear_snap_state_for_window(id);
 
-        if !self.floating_windows.remove(&id) {
-            // The window was tiled; switch it to floating.
+        if self.floating_windows.remove(&id) {
+            // Returning from floating does not silently edit a user-managed tree.
+            if matches!(
+                self.layout_mode,
+                vanta_ipc::LayoutMode::Manual | vanta_ipc::LayoutMode::Fractional
+            ) {
+                self.unplaced_windows.insert(id);
+            }
+        } else {
+            self.unplaced_windows.remove(&id);
             self.floating_windows.insert(id);
         }
 
@@ -380,6 +376,7 @@ impl Vanta {
         };
 
         self.clear_snap_state_for_window(id);
+        self.unplaced_windows.remove(&id);
         self.floating_windows.insert(id);
         self.layout_sizes.remove(&id);
         self.relayout_windows();
@@ -389,6 +386,8 @@ impl Vanta {
     /// Remove stale layout metadata after a toplevel is destroyed.
     pub fn prune_layout_state(&mut self) {
         self.floating_windows
+            .retain(|id| self.windows.contains_key(id));
+        self.unplaced_windows
             .retain(|id| self.windows.contains_key(id));
         self.layout_sizes
             .retain(|id, _| self.windows.contains_key(id));
@@ -407,6 +406,56 @@ impl Vanta {
     /// so floating and minimized windows retain their original tree positions.
     /// MasterStack calculates geometry independently without changing topology.
     /// Floating mode leaves all window geometry under direct user control.
+    /// Geometry used to validate explicit edits to Manual/Fractional trees.
+    /// Mirrors the usable area calculation performed by relayout_windows.
+    pub(crate) fn split_edit_bounds(&self) -> Option<(Rect, i32, MinSize)> {
+        let output = self.output.as_ref()?;
+        let area = self.space.output_geometry(output)?;
+
+        let active_snaps: Vec<SnapTarget> = self
+            .snapped_windows
+            .iter()
+            .filter_map(|(&id, &target)| {
+                let window = self.windows.get(&id)?;
+                (window.alive()
+                    && self.space.elements().any(|mapped| mapped == window)
+                    && self.window_workspaces.get(&id) == Some(&self.active_workspace))
+                .then_some(target)
+            })
+            .collect();
+
+        if active_snaps
+            .iter()
+            .any(|target| *target == SnapTarget::Maximize)
+        {
+            return None;
+        }
+
+        let reserve_left = active_snaps
+            .iter()
+            .any(|target| *target == SnapTarget::Left);
+        let reserve_right = active_snaps
+            .iter()
+            .any(|target| *target == SnapTarget::Right);
+
+        let margin = if area.size.w >= 48 && area.size.h >= 48 {
+            12
+        } else {
+            0
+        };
+
+        let full_bounds = Rect::new(
+            area.loc.x.saturating_add(margin),
+            area.loc.y.saturating_add(margin),
+            area.size.w.saturating_sub(margin.saturating_mul(2)),
+            area.size.h.saturating_sub(margin.saturating_mul(2)),
+        );
+
+        let bounds = bounds_with_snap_reservations(full_bounds, reserve_left, reserve_right)?;
+
+        Some((bounds, 12, MinSize::new(320, 240)))
+    }
+
     pub fn relayout_windows(&mut self) {
         if self.layout_mode == vanta_ipc::LayoutMode::Floating {
             return;
@@ -453,6 +502,7 @@ impl Vanta {
             .iter()
             .filter_map(|(&id, window)| {
                 if self.floating_windows.contains(&id)
+                    || self.unplaced_windows.contains(&id)
                     || self.snapped_windows.contains_key(&id)
                     || self
                         .transitions
@@ -490,7 +540,12 @@ impl Vanta {
 
         let Some(bounds) = bounds_with_snap_reservations(full_bounds, reserve_left, reserve_right)
         else {
-            tracing::warn!(?active_snaps, reserve_left, reserve_right, "Layout diagnostic: no usable bounds");
+            tracing::warn!(
+                ?active_snaps,
+                reserve_left,
+                reserve_right,
+                "Layout diagnostic: no usable bounds"
+            );
             return;
         };
 
@@ -532,6 +587,47 @@ impl Vanta {
                     )
                 })
                 .collect()
+            }
+
+            vanta_ipc::LayoutMode::Manual | vanta_ipc::LayoutMode::Fractional => {
+                let tiled_ids: HashSet<u64> = tiled.iter().map(|(id, _)| *id).collect();
+
+                let excluded_ids: Vec<u64> = self
+                    .windows
+                    .keys()
+                    .copied()
+                    .filter(|id| {
+                        self.window_workspaces.get(id) == Some(&self.active_workspace)
+                            && !tiled_ids.contains(id)
+                    })
+                    .collect();
+
+                // These modes project the user's existing topology only.
+                // Missing windows are never automatically inserted.
+                let mut projection = self
+                    .workspace_layouts
+                    .get(&self.active_workspace)
+                    .cloned()
+                    .unwrap_or_default();
+
+                for id in excluded_ids {
+                    projection.remove(id);
+                }
+
+                match projection.layout(bounds, gap, min_size) {
+                    Ok(items) => items
+                        .into_iter()
+                        .map(|item| (item.window_id, item.rect))
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace = self.active_workspace,
+                            ?error,
+                            "Unable to calculate user-managed workspace layout"
+                        );
+                        Vec::new()
+                    }
+                }
             }
 
             vanta_ipc::LayoutMode::Adaptive => {

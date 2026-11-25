@@ -344,6 +344,8 @@ pub struct Vanta {
     pub(crate) overview_plus_vertical_buffer: SolidColorBuffer,
     pub(crate) layout_mode: LayoutMode,
     pub(crate) floating_windows: HashSet<u64>,
+    /// Windows awaiting explicit placement in Manual/Fractional mode.
+    pub(crate) unplaced_windows: HashSet<u64>,
     pub(crate) snapped_windows: HashMap<u64, SnapTarget>,
     pub(crate) maximize_restore_rects: HashMap<u64, Rectangle<i32, Logical>>,
     pub(crate) layout_sizes: HashMap<u64, Size<i32, Logical>>,
@@ -445,6 +447,7 @@ impl Vanta {
         let overview_plus_vertical_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
         let layout_mode = LayoutMode::Adaptive;
         let floating_windows = HashSet::new();
+        let unplaced_windows = HashSet::new();
         let snapped_windows = HashMap::new();
         let maximize_restore_rects = HashMap::new();
         let layout_sizes = HashMap::new();
@@ -493,6 +496,7 @@ impl Vanta {
             overview_plus_vertical_buffer,
             layout_mode,
             floating_windows,
+            unplaced_windows,
             snapped_windows,
             maximize_restore_rects,
             layout_sizes,
@@ -592,6 +596,12 @@ impl Vanta {
         let id = self.window_ids.allocate()?;
         self.window_workspaces.insert(id, self.active_workspace);
         self.window_locations.insert(id, (0, 0).into());
+        if matches!(
+            self.layout_mode,
+            LayoutMode::Manual | LayoutMode::Fractional
+        ) {
+            self.unplaced_windows.insert(id);
+        }
         self.motion.insert_window(id, 0.0, 0.0);
         self.windows.insert(id, window);
         Some(id)
@@ -1166,6 +1176,7 @@ impl Vanta {
             self.minimized_windows.remove(id);
             self.transitions.remove(id);
             self.floating_windows.remove(id);
+            self.unplaced_windows.remove(id);
             self.snapped_windows.remove(id);
             self.maximize_restore_rects.remove(id);
             self.layout_sizes.remove(id);
@@ -1227,9 +1238,265 @@ impl Vanta {
             ),
 
             Action::SetLayoutMode { mode } => {
+                let entering_user_managed =
+                    matches!(mode, LayoutMode::Manual | LayoutMode::Fractional)
+                        && !matches!(
+                            self.layout_mode,
+                            LayoutMode::Manual | LayoutMode::Fractional
+                        );
+
+                if entering_user_managed {
+                    let pending_ids: Vec<u64> = self
+                        .windows
+                        .keys()
+                        .copied()
+                        .filter(|id| {
+                            if self.floating_windows.contains(id) {
+                                return false;
+                            }
+
+                            let already_placed = self
+                                .window_workspaces
+                                .get(id)
+                                .and_then(|workspace| self.workspace_layouts.get(workspace))
+                                .is_some_and(|tree| tree.contains(*id));
+
+                            !already_placed
+                        })
+                        .collect();
+
+                    self.unplaced_windows.extend(pending_ids);
+                }
+
+                // Automatic takes responsibility for inserting pending windows.
+                if mode == LayoutMode::Adaptive {
+                    self.unplaced_windows.clear();
+                }
+
                 self.layout_mode = mode;
                 self.relayout_windows();
                 response(RequestStatus::Completed, ActionResult::LayoutMode { mode })
+            }
+
+            Action::InsertWindowInLayout {
+                id,
+                target_id,
+                axis,
+                ratio,
+            } => {
+                if !matches!(
+                    self.layout_mode,
+                    LayoutMode::Manual | LayoutMode::Fractional
+                ) {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message:
+                                "Explicit insertion is only available in Manual or Fractional mode"
+                                    .to_owned(),
+                        },
+                    );
+                }
+
+                let is_valid_pending = self.windows.get(&id).is_some_and(|window| {
+                    window.alive()
+                        && self.space.elements().any(|mapped| mapped == window)
+                        && self.window_workspaces.get(&id) == Some(&self.active_workspace)
+                        && self.unplaced_windows.contains(&id)
+                        && !self.floating_windows.contains(&id)
+                        && !self.snapped_windows.contains_key(&id)
+                });
+
+                if !is_valid_pending {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!("Window {id} is not an eligible pending window in the active workspace"),
+                        },
+                    );
+                }
+
+                let target_valid = target_id == 0
+                    || (self.windows.get(&target_id).is_some_and(|window| {
+                        window.alive()
+                            && self.space.elements().any(|mapped| mapped == window)
+                            && self.window_workspaces.get(&target_id)
+                                == Some(&self.active_workspace)
+                            && !self.floating_windows.contains(&target_id)
+                            && !self.unplaced_windows.contains(&target_id)
+                            && !self.snapped_windows.contains_key(&target_id)
+                    }));
+
+                if !target_valid {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!(
+                                "Target window {target_id} is not eligible for insertion"
+                            ),
+                        },
+                    );
+                }
+
+                let Some((bounds, gap, min_size)) = self.split_edit_bounds() else {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: "No usable layout bounds are available".to_owned(),
+                        },
+                    );
+                };
+
+                let result = {
+                    let tree = self
+                        .workspace_layouts
+                        .entry(self.active_workspace)
+                        .or_default();
+
+                    if tree.is_empty() {
+                        if target_id != 0 {
+                            Err(crate::layout_engine::LayoutError::WindowNotFound(target_id))
+                        } else {
+                            tree.insert(id, None, bounds, gap, min_size)
+                        }
+                    } else if target_id == 0 {
+                        Err(crate::layout_engine::LayoutError::WindowNotFound(0))
+                    } else {
+                        tree.insert_with_ratio(id, target_id, axis, ratio, bounds, gap, min_size)
+                    }
+                };
+
+                match result {
+                    Ok(()) => {
+                        self.unplaced_windows.remove(&id);
+                        self.relayout_windows();
+                        response(RequestStatus::Completed, ActionResult::Ok)
+                    }
+                    Err(error) => response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!("Unable to insert window into split tree: {error:?}"),
+                        },
+                    ),
+                }
+            }
+
+            Action::SetSplitRatio { window_id, ratio } => {
+                if self.layout_mode != LayoutMode::Fractional {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: "Split ratios are editable only in Fractional mode".to_owned(),
+                        },
+                    );
+                }
+
+                let eligible = self.windows.get(&window_id).is_some_and(|window| {
+                    window.alive()
+                        && self.space.elements().any(|mapped| mapped == window)
+                        && self.window_workspaces.get(&window_id) == Some(&self.active_workspace)
+                        && !self.floating_windows.contains(&window_id)
+                        && !self.unplaced_windows.contains(&window_id)
+                        && !self.snapped_windows.contains_key(&window_id)
+                });
+
+                if !eligible {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!(
+                                "Window {window_id} is not eligible for ratio editing"
+                            ),
+                        },
+                    );
+                }
+
+                let Some((bounds, gap, min_size)) = self.split_edit_bounds() else {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: "No usable layout bounds are available".to_owned(),
+                        },
+                    );
+                };
+
+                let result = self
+                    .workspace_layouts
+                    .get_mut(&self.active_workspace)
+                    .ok_or(crate::layout_engine::LayoutError::WindowNotFound(window_id))
+                    .and_then(|tree| tree.set_split_ratio(window_id, ratio, bounds, gap, min_size));
+
+                match result {
+                    Ok(()) => {
+                        self.relayout_windows();
+                        response(RequestStatus::Completed, ActionResult::Ok)
+                    }
+                    Err(error) => response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!("Unable to change split ratio: {error:?}"),
+                        },
+                    ),
+                }
+            }
+
+            Action::SetSplitAxis { window_id, axis } => {
+                if self.layout_mode != LayoutMode::Manual {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: "Split orientation is editable only in Manual mode".to_owned(),
+                        },
+                    );
+                }
+
+                let eligible = self.windows.get(&window_id).is_some_and(|window| {
+                    window.alive()
+                        && self.space.elements().any(|mapped| mapped == window)
+                        && self.window_workspaces.get(&window_id) == Some(&self.active_workspace)
+                        && !self.floating_windows.contains(&window_id)
+                        && !self.unplaced_windows.contains(&window_id)
+                        && !self.snapped_windows.contains_key(&window_id)
+                });
+
+                if !eligible {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!(
+                                "Window {window_id} is not eligible for split editing"
+                            ),
+                        },
+                    );
+                }
+
+                let Some((bounds, gap, min_size)) = self.split_edit_bounds() else {
+                    return response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: "No usable layout bounds are available".to_owned(),
+                        },
+                    );
+                };
+
+                let result = self
+                    .workspace_layouts
+                    .get_mut(&self.active_workspace)
+                    .ok_or(crate::layout_engine::LayoutError::WindowNotFound(window_id))
+                    .and_then(|tree| tree.set_split_axis(window_id, axis, bounds, gap, min_size));
+
+                match result {
+                    Ok(()) => {
+                        self.relayout_windows();
+                        response(RequestStatus::Completed, ActionResult::Ok)
+                    }
+                    Err(error) => response(
+                        RequestStatus::Rejected,
+                        ActionResult::Err {
+                            message: format!("Unable to change split orientation: {error:?}"),
+                        },
+                    ),
+                }
             }
 
             Action::FocusWindow { id } => match self.focus_window(id) {
