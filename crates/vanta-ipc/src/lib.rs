@@ -2,7 +2,20 @@
 use serde::{Deserialize, Serialize};
 
 /// Current IPC protocol version.
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Global window arrangement strategy selected by the user.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LayoutMode {
+    /// Persistent adaptive split-tree tiling. This is the fresh-install default.
+    #[default]
+    Adaptive,
+    /// Independent, overlapping windows.
+    Floating,
+    /// One master window with supporting windows in a stack.
+    MasterStack,
+}
 
 /// A request sent to the Vanta compositor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,6 +119,10 @@ pub enum Action {
     SwitchWorkspace {
         index: u32,
     },
+    GetLayoutMode,
+    SetLayoutMode {
+        mode: LayoutMode,
+    },
 
     /// Intent path — executed only after AION mediation.
     RequestIntent {
@@ -138,6 +155,9 @@ pub struct OverviewWorkspaceInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActionResult {
+    LayoutMode {
+        mode: LayoutMode,
+    },
     Ok,
     MinimizedWindows {
         windows: Vec<MinimizedWindowInfo>,
@@ -253,6 +273,10 @@ mod action_tests {
             Action::GetOverviewData,
             Action::CreateWorkspace,
             Action::SwitchWorkspace { index: 3 },
+            Action::GetLayoutMode,
+            Action::SetLayoutMode {
+                mode: LayoutMode::MasterStack,
+            },
             Action::RequestIntent {
                 text: "Open workspace two".to_owned(),
             },
@@ -269,6 +293,9 @@ mod action_tests {
     fn all_results_round_trip() {
         let results = [
             ActionResult::Ok,
+            ActionResult::LayoutMode {
+                mode: LayoutMode::Floating,
+            },
             ActionResult::MinimizedWindows {
                 windows: vec![MinimizedWindowInfo {
                     id: 42,

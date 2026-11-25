@@ -16,7 +16,6 @@ use smithay::{
         MotionEvent, PointerGrab, PointerInnerHandle, RelativeMotionEvent,
     },
     reexports::{
-        wayland_protocols::xdg::shell::server::xdg_toplevel,
         wayland_server::protocol::wl_surface::WlSurface,
     },
     utils::{Logical, Point, Rectangle},
@@ -57,6 +56,13 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
             .find_map(|(id, window)| (window == &self.window).then_some(*id))
         {
             data.window_locations.insert(id, new_location);
+            data.motion.animate_window(
+                id,
+                f64::from(new_location.x),
+                f64::from(new_location.y),
+                1.0,
+                1.0,
+            );
         }
 
         // Minimize activates when the dragged window's bottom edge enters
@@ -150,32 +156,14 @@ impl PointerGrab<Vanta> for MoveSurfaceGrab {
                     tracing::warn!("Could not resolve stable ID for dragged window");
                 }
             } else if let Some((target, rect)) = self.snap_target.take() {
-                // Apply the last valid snap target before ending the move grab.
-                data.space.map_element(self.window.clone(), rect.loc, true);
-
                 if let Some(id) = data
                     .windows
                     .iter()
                     .find_map(|(id, window)| (window == &self.window).then_some(*id))
                 {
-                    data.window_locations.insert(id, rect.loc);
-                }
-
-                if let Some(toplevel) = self.window.toplevel().filter(|toplevel| toplevel.alive()) {
-                    toplevel.with_pending_state(|state| {
-                        state.size = Some(rect.size);
-
-                        match target {
-                            SnapTarget::Maximize => {
-                                state.states.set(xdg_toplevel::State::Maximized);
-                            }
-                            SnapTarget::Left | SnapTarget::Right => {
-                                state.states.unset(xdg_toplevel::State::Maximized);
-                            }
-                        }
-                    });
-
-                    toplevel.send_pending_configure();
+                    data.set_window_snapped(id, target, rect);
+                } else {
+                    tracing::warn!("Could not resolve stable ID for snapped window");
                 }
             }
 

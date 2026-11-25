@@ -36,15 +36,86 @@ impl XdgShellHandler for Vanta {
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
         let window = Window::new_wayland_window(surface);
 
-        if self.register_window(window.clone()).is_none() {
+        let Some(id) = self.register_window(window.clone()) else {
             tracing::error!(
                 smithay_window_id = window.id(),
                 "Vanta window ID space exhausted; refusing to map unregistered window"
             );
             return;
-        }
+        };
 
-        self.space.map_element(window, (0, 0), false);
+        let location = self
+            .output
+            .as_ref()
+            .and_then(|output| self.space.output_geometry(output))
+            .map(|area| {
+                let margin = if area.size.w >= 48 && area.size.h >= 48 {
+                    12
+                } else {
+                    0
+                };
+
+                let available_width = area.size.w.saturating_sub(margin * 2).max(1);
+                let available_height = area.size.h.saturating_sub(margin * 2).max(1);
+
+                let geometry = window.geometry();
+
+                let requested_width = if geometry.size.w >= 64 {
+                    geometry.size.w
+                } else {
+                    960
+                };
+
+                let requested_height = if geometry.size.h >= 64 {
+                    geometry.size.h
+                } else {
+                    640
+                };
+
+                let width = requested_width.min(available_width);
+                let height = requested_height.min(available_height);
+
+                let stagger = (id % 7) as i32 * 28;
+
+                let min_x = area.loc.x.saturating_add(margin);
+                let min_y = area.loc.y.saturating_add(margin);
+
+                let max_x = area
+                    .loc
+                    .x
+                    .saturating_add(area.size.w)
+                    .saturating_sub(margin)
+                    .saturating_sub(width)
+                    .max(min_x);
+
+                let max_y = area
+                    .loc
+                    .y
+                    .saturating_add(area.size.h)
+                    .saturating_sub(margin)
+                    .saturating_sub(height)
+                    .max(min_y);
+
+                let x = area
+                    .loc
+                    .x
+                    .saturating_add(area.size.w.saturating_sub(width) / 2)
+                    .saturating_add(stagger)
+                    .clamp(min_x, max_x);
+
+                let y = area
+                    .loc
+                    .y
+                    .saturating_add(area.size.h.saturating_sub(height) / 2)
+                    .saturating_add(stagger)
+                    .clamp(min_y, max_y);
+
+                (x, y).into()
+            })
+            .unwrap_or_else(|| (0, 0).into());
+
+        self.window_locations.insert(id, location);
+        self.space.map_element(window, location, false);
         self.relayout_windows();
     }
 
@@ -99,11 +170,11 @@ impl XdgShellHandler for Vanta {
             return;
         };
 
+        self.make_window_floating(&window);
+
         let Some(initial_window_location) = self.space.element_location(&window) else {
             return;
         };
-
-        self.make_window_floating(&window);
 
         let grab = MoveSurfaceGrab {
             start_data,
@@ -150,13 +221,13 @@ impl XdgShellHandler for Vanta {
             return;
         };
 
+        self.make_window_floating(&window);
+
         let Some(initial_window_location) = self.space.element_location(&window) else {
             return;
         };
 
         let initial_window_size = window.geometry().size;
-
-        self.make_window_floating(&window);
 
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Resizing);

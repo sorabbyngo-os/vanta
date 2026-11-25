@@ -78,6 +78,9 @@ pub fn start(event_loop: &mut EventLoop<Vanta>) -> io::Result<IpcServer> {
         .insert_source(receiver, |event, _, state| {
             if let Event::Msg(message) = event {
                 let response = state.dispatch_ipc_request(message.request);
+                if let Some(sender) = state.native_redraw_sender.as_ref() {
+                    let _ = sender.send(());
+                }
                 let _ = message.reply.send(response);
             }
         })

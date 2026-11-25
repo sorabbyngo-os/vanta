@@ -1,6 +1,6 @@
 use crate::{grabs::resize_grab, state::ClientState, Vanta};
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{allocator::dmabuf::Dmabuf, renderer::utils::on_commit_buffer_handler},
     desktop::layer_map_for_output,
     reexports::wayland_server::{
         protocol::{wl_buffer, wl_surface::WlSurface},
@@ -12,6 +12,7 @@ use smithay::{
             get_parent, is_sync_subsurface, CompositorClientState, CompositorHandler,
             CompositorState,
         },
+        dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier},
         shell::wlr_layer::WlrLayerShellHandler,
         shm::{ShmHandler, ShmState},
     },
@@ -49,6 +50,8 @@ impl CompositorHandler for Vanta {
 
                 if let Some(layer) = layer {
                     map.arrange();
+                    let geometry = map.layer_geometry(&layer);
+                    eprintln!("vanta-comp: arranged layer geometry={geometry:?}");
                 }
             }
         }
@@ -81,6 +84,30 @@ impl CompositorHandler for Vanta {
 
 impl BufferHandler for Vanta {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+impl DmabufHandler for Vanta {
+    fn dmabuf_state(&mut self) -> &mut DmabufState {
+        &mut self.dmabuf_state
+    }
+
+    fn dmabuf_imported(
+        &mut self,
+        _global: &DmabufGlobal,
+        dmabuf: Dmabuf,
+        notifier: ImportNotifier,
+    ) {
+        let imported = self
+            .native_renderer_registry
+            .as_ref()
+            .is_some_and(|registry| registry.import_dmabuf(&dmabuf));
+
+        if imported {
+            let _ = notifier.successful::<Vanta>();
+        } else {
+            notifier.failed();
+        }
+    }
 }
 
 impl ShmHandler for Vanta {

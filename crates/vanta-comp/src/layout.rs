@@ -1,7 +1,12 @@
+use crate::{
+    layout_engine::{MinSize, Rect},
+    state::WindowTransition,
+};
 use smithay::{
     desktop::Window,
     utils::{IsAlive, Logical, Point, Rectangle, Size},
 };
+use std::collections::HashSet;
 
 use crate::Vanta;
 
@@ -157,8 +162,187 @@ fn calculate_layout(
     targets
 }
 
+/// Constrain the tiled workspace to the area not occupied by snapped windows.
+/// Returns `None` when both sides are reserved or no usable area remains.
+fn bounds_with_snap_reservations(
+    bounds: Rect,
+    reserve_left: bool,
+    reserve_right: bool,
+) -> Option<Rect> {
+    const GAP: i32 = 12;
+
+    if reserve_left && reserve_right {
+        return None;
+    }
+
+    if !reserve_left && !reserve_right {
+        return (bounds.width > 0 && bounds.height > 0).then_some(bounds);
+    }
+
+    let half_width = bounds.width.saturating_sub(GAP).max(0) / 2;
+    let remaining_width = bounds.width.saturating_sub(half_width).saturating_sub(GAP);
+
+    if bounds.height <= 0 || remaining_width <= 0 || half_width <= 0 {
+        return None;
+    }
+
+    if reserve_left {
+        Some(Rect::new(
+            bounds.x.saturating_add(half_width).saturating_add(GAP),
+            bounds.y,
+            remaining_width,
+            bounds.height,
+        ))
+    } else {
+        Some(Rect::new(bounds.x, bounds.y, half_width, bounds.height))
+    }
+}
+
+pub(crate) fn set_window_maximized_protocol_state(window: &Window, maximized: bool) {
+    if let Some(toplevel) = window.toplevel().filter(|toplevel| toplevel.alive()) {
+        toplevel.with_pending_state(|state| {
+            if maximized {
+                state.states.set(
+                    smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                );
+            } else {
+                state.states.unset(
+                    smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                );
+            }
+        });
+        toplevel.send_pending_configure();
+    }
+}
+
 impl Vanta {
+    /// Restore a window's geometry saved before it was maximized.
+    fn restore_window_geometry(
+        &mut self,
+        id: u64,
+        rect: Rectangle<i32, Logical>,
+    ) {
+        let Some(window) = self.windows.get(&id).cloned() else {
+            return;
+        };
+
+        self.space.map_element(window.clone(), rect.loc, true);
+        self.window_locations.insert(id, rect.loc);
+        self.motion.snap_window_position(
+            id,
+            f64::from(rect.loc.x),
+            f64::from(rect.loc.y),
+        );
+
+        if let Some(toplevel) = window.toplevel().filter(|surface| surface.alive()) {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(rect.size);
+                state.states.unset(
+                    smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                );
+            });
+            toplevel.send_pending_configure();
+        }
+
+        self.layout_sizes.remove(&id);
+    }
+
+    /// Commit a snapped window and relayout the remaining tiled windows.
+    pub fn set_window_snapped(
+        &mut self,
+        id: u64,
+        target: SnapTarget,
+        rect: Rectangle<i32, Logical>,
+    ) {
+        let displaced_ids: Vec<u64> = self
+            .snapped_windows
+            .iter()
+            .filter_map(|(&other_id, &current)| {
+                let conflicts = match target {
+                    SnapTarget::Maximize => true,
+                    SnapTarget::Left => matches!(current, SnapTarget::Left | SnapTarget::Maximize),
+                    SnapTarget::Right => {
+                        matches!(current, SnapTarget::Right | SnapTarget::Maximize)
+                    }
+                };
+                (other_id != id && conflicts).then_some(other_id)
+            })
+            .collect();
+
+        for displaced_id in displaced_ids {
+            let displaced_target = self.snapped_windows.remove(&displaced_id);
+            if displaced_target == Some(SnapTarget::Maximize) {
+                if let Some(saved_rect) = self.maximize_restore_rects.remove(&displaced_id) {
+                    self.restore_window_geometry(displaced_id, saved_rect);
+                } else if let Some(window) = self.windows.get(&displaced_id) {
+                    set_window_maximized_protocol_state(window, false);
+                }
+            }
+        }
+
+        let Some(window) = self.windows.get(&id).cloned() else {
+            return;
+        };
+
+        if target == SnapTarget::Maximize {
+            if !self.maximize_restore_rects.contains_key(&id) {
+                if let Some(location) = self.space.element_location(&window) {
+                    self.maximize_restore_rects.insert(
+                        id,
+                        Rectangle::new(location, window.geometry().size),
+                    );
+                }
+            }
+        } else {
+            self.maximize_restore_rects.remove(&id);
+        }
+
+        self.floating_windows.remove(&id);
+        self.snapped_windows.insert(id, target);
+        self.layout_sizes.remove(&id);
+
+        self.space.map_element(window.clone(), rect.loc, true);
+        self.window_locations.insert(id, rect.loc);
+        self.motion.snap_window_position(
+            id,
+            f64::from(rect.loc.x),
+            f64::from(rect.loc.y),
+        );
+
+        if let Some(toplevel) = window.toplevel().filter(|surface| surface.alive()) {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(rect.size);
+                if target == SnapTarget::Maximize {
+                    state.states.set(
+                        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                    );
+                } else {
+                    state.states.unset(
+                        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                    );
+                }
+            });
+            toplevel.send_pending_configure();
+        }
+
+        self.relayout_windows();
+    }
+
     /// Toggle a mapped window between tiled and floating layouts.
+    fn clear_snap_state_for_window(&mut self, id: u64) {
+        let previous_target = self.snapped_windows.remove(&id);
+
+        if previous_target == Some(SnapTarget::Maximize) {
+            if let Some(saved_rect) = self.maximize_restore_rects.remove(&id) {
+                self.restore_window_geometry(id, saved_rect);
+            } else if let Some(window) = self.windows.get(&id) {
+                set_window_maximized_protocol_state(window, false);
+            }
+        } else {
+            self.maximize_restore_rects.remove(&id);
+        }
+    }
+
     pub fn toggle_float(&mut self, id: u64) -> Result<(), String> {
         let window = self
             .windows
@@ -169,6 +353,8 @@ impl Vanta {
         if !window.alive() || !self.space.elements().any(|mapped| mapped == &window) {
             return Err(format!("Window {id} is not currently mapped"));
         }
+
+        self.clear_snap_state_for_window(id);
 
         if !self.floating_windows.remove(&id) {
             // The window was tiled; switch it to floating.
@@ -193,6 +379,7 @@ impl Vanta {
             return;
         };
 
+        self.clear_snap_state_for_window(id);
         self.floating_windows.insert(id);
         self.layout_sizes.remove(&id);
         self.relayout_windows();
@@ -205,13 +392,26 @@ impl Vanta {
             .retain(|id| self.windows.contains_key(id));
         self.layout_sizes
             .retain(|id, _| self.windows.contains_key(id));
+        self.snapped_windows
+            .retain(|id, _| self.windows.contains_key(id));
     }
 
-    /// Recalculate the single-output master-and-stack layout.
+    /// Recalculate the active workspace's adaptive split-tree layout.
     ///
-    /// Client sizes are requested through XDG configure events. Vanta does not
-    /// assume that a client has accepted or committed a requested size.
+    /// The workspace tree is persistent: relayout changes geometry without
+    /// rebuilding window topology. Client sizes are requested through XDG
+    /// configure events and are not assumed to have been accepted.
+    /// Recalculate the active workspace using its selected layout strategy.
+    ///
+    /// Adaptive mode uses a temporary projection of the persistent split tree
+    /// so floating and minimized windows retain their original tree positions.
+    /// MasterStack calculates geometry independently without changing topology.
+    /// Floating mode leaves all window geometry under direct user control.
     pub fn relayout_windows(&mut self) {
+        if self.layout_mode == vanta_ipc::LayoutMode::Floating {
+            return;
+        }
+
         let Some(output) = self.output.clone() else {
             return;
         };
@@ -220,13 +420,47 @@ impl Vanta {
             return;
         };
 
+        let active_snaps: Vec<(u64, SnapTarget)> = self
+            .snapped_windows
+            .iter()
+            .filter_map(|(&id, &target)| {
+                let window = self.windows.get(&id)?;
+                (window.alive()
+                    && self.space.elements().any(|mapped| mapped == window)
+                    && self.window_workspaces.get(&id) == Some(&self.active_workspace))
+                .then_some((id, target))
+            })
+            .collect();
+
+        // A maximized window owns the complete output until it is moved,
+        // resized, or replaced by another snap target.
+        if active_snaps
+            .iter()
+            .any(|(_, target)| *target == SnapTarget::Maximize)
+        {
+            return;
+        }
+
+        let reserve_left = active_snaps
+            .iter()
+            .any(|(_, target)| *target == SnapTarget::Left);
+        let reserve_right = active_snaps
+            .iter()
+            .any(|(_, target)| *target == SnapTarget::Right);
+
         let mut tiled: Vec<(u64, Window)> = self
             .windows
             .iter()
             .filter_map(|(&id, window)| {
                 if self.floating_windows.contains(&id)
+                    || self.snapped_windows.contains_key(&id)
+                    || self
+                        .transitions
+                        .get(&id)
+                        .is_some_and(WindowTransition::is_minimizing)
                     || !window.alive()
                     || !self.space.elements().any(|mapped| mapped == window)
+                    || self.window_workspaces.get(&id) != Some(&self.active_workspace)
                 {
                     return None;
                 }
@@ -241,14 +475,151 @@ impl Vanta {
             return;
         }
 
-        let window_ids: Vec<u64> = tiled.iter().map(|(id, _)| *id).collect();
-        let targets = calculate_layout(&window_ids, area.loc, area.size);
+        let margin = if area.size.w >= 48 && area.size.h >= 48 {
+            12
+        } else {
+            0
+        };
 
-        for ((id, window), (location, requested_size)) in tiled.into_iter().zip(targets.into_iter())
-        {
+        let full_bounds = Rect::new(
+            area.loc.x.saturating_add(margin),
+            area.loc.y.saturating_add(margin),
+            area.size.w.saturating_sub(margin.saturating_mul(2)),
+            area.size.h.saturating_sub(margin.saturating_mul(2)),
+        );
+
+        let Some(bounds) = bounds_with_snap_reservations(full_bounds, reserve_left, reserve_right)
+        else {
+            tracing::warn!(?active_snaps, reserve_left, reserve_right, "Layout diagnostic: no usable bounds");
+            return;
+        };
+
+        tracing::info!(workspace = self.active_workspace, ?active_snaps, reserve_left, reserve_right, ?bounds, tiled_ids = ?tiled.iter().map(|(id, _)| *id).collect::<Vec<_>>(), "Layout diagnostic: snap state and tiled windows");
+
+        let gap = 12;
+        let min_size = MinSize::new(320, 240);
+
+        let focused_window = self.seat.get_keyboard().and_then(|keyboard| {
+            let focused_surface = keyboard.current_focus()?;
+
+            self.windows.iter().find_map(|(&id, window)| {
+                window
+                    .toplevel()
+                    .is_some_and(|toplevel| toplevel.wl_surface() == &focused_surface)
+                    .then_some(id)
+            })
+        });
+
+        // Normalize both layout engines into (window ID, rectangle) pairs.
+        let placements: Vec<(u64, Rect)> = match self.layout_mode {
+            vanta_ipc::LayoutMode::Floating => Vec::new(),
+
+            vanta_ipc::LayoutMode::MasterStack => {
+                let origin: LayoutPosition = (bounds.x, bounds.y).into();
+                let size: LayoutSize = (bounds.width, bounds.height).into();
+
+                calculate_layout(
+                    &tiled.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                    origin,
+                    size,
+                )
+                .into_iter()
+                .enumerate()
+                .map(|(index, (location, size))| {
+                    (
+                        tiled[index].0,
+                        Rect::new(location.x, location.y, size.w, size.h),
+                    )
+                })
+                .collect()
+            }
+
+            vanta_ipc::LayoutMode::Adaptive => {
+                let tiled_ids: HashSet<u64> = tiled.iter().map(|(id, _)| *id).collect();
+
+                let excluded_ids: Vec<u64> = self
+                    .windows
+                    .keys()
+                    .copied()
+                    .filter(|id| {
+                        self.window_workspaces.get(id) == Some(&self.active_workspace)
+                            && !tiled_ids.contains(id)
+                    })
+                    .collect();
+
+                let tree = self
+                    .workspace_layouts
+                    .entry(self.active_workspace)
+                    .or_default();
+
+                // Add new windows to the persistent topology. Existing nodes
+                // and split ratios are retained across ordinary relayouts.
+                for (id, _) in &tiled {
+                    if !tree.contains(*id) {
+                        if let Err(error) = tree.insert_projected(
+                            *id,
+                            focused_window,
+                            &excluded_ids,
+                            bounds,
+                            gap,
+                            min_size,
+                        ) {
+                            tracing::warn!(
+                                window_id = *id,
+                                ?error,
+                                "Unable to insert window into adaptive layout"
+                            );
+                        }
+                    }
+                }
+
+                // Project only currently tiled windows. Do not remove floating
+                // or minimized windows from the persistent workspace tree.
+                let mut projection = tree.clone();
+                for id in excluded_ids {
+                    projection.remove(id);
+                }
+
+                match projection.layout(bounds, gap, min_size) {
+                    Ok(items) => items
+                        .into_iter()
+                        .map(|item| (item.window_id, item.rect))
+                        .collect(),
+                    Err(error) => {
+                        tracing::warn!(
+                            workspace = self.active_workspace,
+                            ?error,
+                            "Unable to calculate adaptive workspace layout"
+                        );
+                        Vec::new()
+                    }
+                }
+            }
+        };
+
+        tracing::info!(workspace = self.active_workspace, placements = ?placements, "Layout diagnostic: computed placements");
+
+        for (id, rect) in placements {
+            let Some(window) = self.windows.get(&id).cloned() else {
+                continue;
+            };
+
+            // Ignore stale or excluded projection entries.
+            if !tiled.iter().any(|(tiled_id, _)| *tiled_id == id) {
+                continue;
+            }
+
+            let location: LayoutPosition = (rect.x, rect.y).into();
+            let requested_size: LayoutSize = (rect.width, rect.height).into();
+
+            self.motion
+                .animate_window(id, f64::from(location.x), f64::from(location.y), 1.0, 1.0);
+
             if self.space.element_location(&window) != Some(location) {
                 self.space.relocate_element(&window, location);
             }
+
+            self.window_locations.insert(id, location);
 
             if self.layout_sizes.get(&id) == Some(&requested_size) {
                 continue;
@@ -366,5 +737,73 @@ mod tests {
 
         assert_eq!(targets[0].0, (112, 62).into());
         assert_eq!(targets[0].1, (1256, 696).into());
+    }
+
+    #[test]
+    fn left_snap_reserves_left_half_for_snapped_window() {
+        let bounds = Rect::new(12, 12, 1896, 1056);
+        let remaining = bounds_with_snap_reservations(bounds, true, false).unwrap();
+
+        assert_eq!(remaining, Rect::new(966, 12, 942, 1056));
+    }
+
+    #[test]
+    fn right_snap_reserves_right_half_for_snapped_window() {
+        let bounds = Rect::new(12, 12, 1896, 1056);
+        let remaining = bounds_with_snap_reservations(bounds, false, true).unwrap();
+
+        assert_eq!(remaining, Rect::new(12, 12, 942, 1056));
+    }
+
+    #[test]
+    fn both_side_snaps_leave_no_tiled_region() {
+        let bounds = Rect::new(12, 12, 1896, 1056);
+
+        assert!(bounds_with_snap_reservations(bounds, true, true).is_none());
+    }
+
+    #[test]
+    fn adaptive_windows_reflow_into_region_after_left_snap() {
+        use crate::layout_engine::SplitTree;
+
+        const GAP: i32 = 12;
+        let min_size = MinSize::new(320, 240);
+        let full_bounds = Rect::new(12, 12, 1896, 1056);
+        let remaining = bounds_with_snap_reservations(full_bounds, true, false).unwrap();
+
+        let mut tree = SplitTree::new();
+        tree.insert(1, None, full_bounds, GAP, min_size).unwrap();
+        tree.insert(2, Some(1), full_bounds, GAP, min_size).unwrap();
+        tree.insert(3, Some(1), full_bounds, GAP, min_size).unwrap();
+
+        // Window 3 is snapped; only windows 1 and 2 should tile in the remainder.
+        let mut visible = tree.clone();
+        assert!(visible.remove(3));
+        let placements = visible.layout(remaining, GAP, min_size).unwrap();
+
+        assert_eq!(placements.len(), 2);
+        assert_eq!(
+            placements.iter().map(|p| p.window_id).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+
+        assert!(placements.iter().all(|p| {
+            p.rect.x >= remaining.x
+                && p.rect.y >= remaining.y
+                && p.rect.x + p.rect.width <= remaining.x + remaining.width
+                && p.rect.y + p.rect.height <= remaining.y + remaining.height
+                && p.rect.width >= min_size.width
+                && p.rect.height >= min_size.height
+        }));
+    }
+
+    #[test]
+    fn no_snap_preserves_full_layout_bounds() {
+        let bounds = Rect::new(12, 12, 1896, 1056);
+
+        assert_eq!(
+            bounds_with_snap_reservations(bounds, false, false),
+            Some(bounds)
+        );
     }
 }

@@ -1,4 +1,4 @@
-use std::{io::Cursor, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use smithay::{
     backend::{
@@ -20,11 +20,15 @@ use smithay::{
         winit::{self, WinitEvent},
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
-    reexports::calloop::EventLoop,
+    reexports::calloop::{channel, EventLoop},
     utils::{IsAlive, Logical, Point, Rectangle, Scale, Transform},
 };
 
-use crate::{state::create_overview_glass_buffer, Vanta};
+use crate::{
+    motion_render::{render_animated_windows, AnimatedWindowElement},
+    state::create_overview_glass_buffer,
+    Vanta,
+};
 
 render_elements! {
     OverviewRenderElements<=GlesRenderer>;
@@ -34,6 +38,7 @@ render_elements! {
         GlesRenderer,
         WaylandSurfaceRenderElement<GlesRenderer>
     >,
+    Animated=AnimatedWindowElement,
     Thumbnail=CropRenderElement<
         RelocateRenderElement<
             RescaleRenderElement<WaylandSurfaceRenderElement<GlesRenderer>>
@@ -41,63 +46,54 @@ render_elements! {
     >,
 }
 
+include!(concat!(env!("OUT_DIR"), "/wallpaper_meta.rs"));
+
 pub(crate) fn load_wallpaper() -> Result<MemoryRenderBuffer, Box<dyn std::error::Error>> {
-    let bytes = include_bytes!("../../../assets/wallpapers/vanta-default.png");
-    let decoder = png::Decoder::new(Cursor::new(bytes.as_slice()));
-    let mut reader = decoder.read_info()?;
-    let mut decoded = vec![
-        0;
-        reader.output_buffer_size().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Invalid wallpaper dimensions",
-            )
-        })?
-    ];
-    let info = reader.next_frame(&mut decoded)?;
-    let pixels = &decoded[..info.buffer_size()];
+    let started = std::time::Instant::now();
+    let pixels = include_bytes!(concat!(env!("OUT_DIR"), "/wallpaper.rgba"));
 
-    let mut rgba = Vec::with_capacity(info.width as usize * info.height as usize * 4);
-    match info.color_type {
-        png::ColorType::Rgb => {
-            for pixel in pixels.chunks_exact(3) {
-                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
-            }
-        }
-        png::ColorType::Rgba => {
-            for pixel in pixels.chunks_exact(4) {
-                rgba.extend_from_slice(pixel);
-            }
-        }
-        _ => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Wallpaper must decode to RGB or RGBA",
-            )
-            .into());
-        }
-    }
-
-    let width = i32::try_from(info.width)?;
-    let height = i32::try_from(info.height)?;
-
-    Ok(MemoryRenderBuffer::from_slice(
-        &rgba,
+    let buffer = MemoryRenderBuffer::from_slice(
+        pixels,
         smithay::backend::allocator::Fourcc::Abgr8888,
-        (width, height),
+        (WALLPAPER_WIDTH, WALLPAPER_HEIGHT),
         1,
         Transform::Normal,
         None,
-    ))
+    );
+
+    tracing::info!(
+        wallpaper_load_ms = started.elapsed().as_secs_f64() * 1000.0,
+        wallpaper_width = WALLPAPER_WIDTH,
+        wallpaper_height = WALLPAPER_HEIGHT,
+        "Vanta wallpaper loaded"
+    );
+
+    Ok(buffer)
 }
 
 pub fn init_winit(
     event_loop: &mut EventLoop<Vanta>,
     state: &mut Vanta,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let backend_started = std::time::Instant::now();
     let (mut backend, winit) = winit::init::<GlesRenderer>()?;
+    let winit_init_ms = backend_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("VANTA_TIMING winit_init_ms={winit_init_ms:.3}");
+    tracing::info!(winit_init_ms, "Vanta Winit and GLES backend initialized");
     backend.window().set_title("Vanta");
     backend.window().set_decorations(false);
+
+    let window_handle = backend.window_handle();
+    let redraw_window = Arc::clone(&window_handle);
+    let (redraw_sender, redraw_receiver) = channel::channel::<()>();
+    state.native_redraw_sender = Some(redraw_sender);
+    event_loop
+        .handle()
+        .insert_source(redraw_receiver, move |event, _, _state| {
+            if let channel::Event::Msg(()) = event {
+                redraw_window.request_redraw();
+            }
+        })?;
 
     let mode = Mode {
         size: backend.window_size(),
@@ -129,6 +125,8 @@ pub fn init_winit(
 
     let mut damage_tracker = OutputDamageTracker::from_output(&output);
     let wallpaper_buffer = load_wallpaper()?;
+    let mut first_frame_logged = false;
+    let redraw_window_handle = Arc::clone(&window_handle);
 
     event_loop
         .handle()
@@ -157,9 +155,25 @@ pub fn init_winit(
 
                     // Recalculate window layouts using the updated geometry.
                     state.relayout_windows();
+                    if let Some(sender) = state.native_redraw_sender.as_ref() {
+                        let _ = sender.send(());
+                    }
                 }
-                WinitEvent::Input(event) => state.process_input_event(event),
+                WinitEvent::Input(event) => {
+                    state.process_input_event(event);
+
+                    // Schedule a Winit frame for pointer movement and
+                    // other input-driven visual updates.
+                    redraw_window_handle.request_redraw();
+
+                    // Also notify native DRM outputs when available.
+                    if let Some(sender) = state.native_redraw_sender.as_ref() {
+                        let _ = sender.send(());
+                    }
+                }
                 WinitEvent::Redraw => {
+                    let motion_active = state.advance_motion();
+
                     let size = backend.window_size();
                     let damage = Rectangle::from_size(size);
                     {
@@ -214,6 +228,13 @@ pub fn init_winit(
                         }
 
                         if state.overview_open {
+                            eprintln!(
+                                "[VANTA-OVERVIEW-ENTRY] active_workspace={} workspace_count={} output={} layout_available={}",
+                                state.active_workspace,
+                                state.workspace_count,
+                                state.output.is_some(),
+                                state.overview_layout().is_some(),
+                            );
                             if let Ok(element) = MemoryRenderBufferRenderElement::from_buffer(
                                 renderer,
                                 Point::<i32, Logical>::from((12, 12))
@@ -550,18 +571,19 @@ pub fn init_winit(
 
                         // Overview thumbnails replace full-size application windows.
                         if !state.overview_open {
-                            let window_elements = state.space.render_elements_for_region(
+                            let window_elements = render_animated_windows(
+                                state,
                                 renderer,
                                 &output_geometry,
-                                scale,
+                                Scale::from(scale),
                                 alpha,
                             );
 
-                            space_elements.extend(window_elements.into_iter().map(|element| {
-                                OverviewRenderElements::Space(
-                                    smithay::desktop::space::SpaceRenderElements::Surface(element),
-                                )
-                            }));
+                            space_elements.extend(
+                                window_elements
+                                    .into_iter()
+                                    .map(OverviewRenderElements::Animated),
+                            );
                         }
 
                         // Bottom and background surfaces are also suppressed in Overview.
@@ -628,6 +650,14 @@ pub fn init_winit(
                     }
                     backend.submit(Some(&[damage])).unwrap();
 
+                    if !first_frame_logged {
+                        tracing::info!(
+                            first_frame_ms = state.start_time.elapsed().as_secs_f64() * 1000.0,
+                            "Vanta first frame submitted"
+                        );
+                        first_frame_logged = true;
+                    }
+
                     if state.overview_open {
                         for (id, window) in &state.windows {
                             if !state.minimized_windows.contains_key(id) && window.alive() {
@@ -653,7 +683,9 @@ pub fn init_winit(
                     state.space.refresh();
                     state.popups.cleanup();
                     let _ = state.display_handle.flush_clients();
-                    backend.window().request_redraw();
+                    if motion_active {
+                        redraw_window_handle.request_redraw();
+                    }
                 }
                 WinitEvent::CloseRequested => {
                     state.loop_signal.stop();
@@ -662,5 +694,6 @@ pub fn init_winit(
             };
         })?;
 
+    window_handle.request_redraw();
     Ok(())
 }

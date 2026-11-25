@@ -2,5 +2,9 @@
 resolver = "2"
 members = [
     "crates/vanta-ipc",
-    "crates/vanta-comp",    "crates/vanta-shell",
+    "crates/vanta-comp",
+    "crates/vanta-shell",
+    "crates/vanta-system",
+    "crates/vanta-apps",
+    "crates/vanta-settings",
 ]

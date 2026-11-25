@@ -4,14 +4,18 @@ use std::{
     sync::Arc,
 };
 
+use crate::layout::SnapTarget;
+use crate::layout_engine::SplitTree;
+
 use vanta_ipc::{
-    Action, ActionResult, MinimizedWindowInfo, OverviewWindowInfo, OverviewWorkspaceInfo, Request,
-    RequestStatus, Response, PROTOCOL_VERSION,
+    Action, ActionResult, LayoutMode, MinimizedWindowInfo, OverviewWindowInfo,
+    OverviewWorkspaceInfo, Request, RequestStatus, Response, PROTOCOL_VERSION,
 };
 
 use smithay::{
     backend::{
         allocator::Fourcc,
+        input::TouchSlot,
         renderer::element::{memory::MemoryRenderBuffer, solid::SolidColorBuffer},
     },
     desktop::{layer_map_for_output, PopupManager, Space, Window, WindowSurfaceType},
@@ -28,6 +32,7 @@ use smithay::{
     utils::{IsAlive, Logical, Point, Rectangle, Serial, Size, SERIAL_COUNTER},
     wayland::{
         compositor::{with_states, CompositorClientState, CompositorState},
+        dmabuf::{DmabufGlobal, DmabufState},
         output::OutputManagerState,
         selection::data_device::DataDeviceState,
         shell::wlr_layer::{Layer, WlrLayerShellState},
@@ -44,6 +49,19 @@ pub struct MinimizedWindowState {
     pub was_floating: bool,
     pub title: Option<String>,
     pub app_id: Option<String>,
+    pub snap_target: Option<SnapTarget>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum WindowTransition {
+    Minimizing(MinimizedWindowState),
+    Restoring(MinimizedWindowState),
+}
+
+impl WindowTransition {
+    pub(crate) fn is_minimizing(&self) -> bool {
+        matches!(self, Self::Minimizing(_))
+    }
 }
 
 /// Build a reusable translucent glass texture for overview cards.
@@ -307,6 +325,7 @@ pub(crate) struct TouchGesture {
 
 pub struct Vanta {
     pub start_time: std::time::Instant,
+    pub(crate) motion_last_tick: std::time::Instant,
     pub socket_name: OsString,
     pub display_handle: DisplayHandle,
 
@@ -323,9 +342,14 @@ pub struct Vanta {
     pub(crate) overview_new_buffer: MemoryRenderBuffer,
     pub(crate) overview_plus_buffer: SolidColorBuffer,
     pub(crate) overview_plus_vertical_buffer: SolidColorBuffer,
+    pub(crate) layout_mode: LayoutMode,
     pub(crate) floating_windows: HashSet<u64>,
+    pub(crate) snapped_windows: HashMap<u64, SnapTarget>,
+    pub(crate) maximize_restore_rects: HashMap<u64, Rectangle<i32, Logical>>,
     pub(crate) layout_sizes: HashMap<u64, Size<i32, Logical>>,
     pub(crate) minimized_windows: HashMap<u64, MinimizedWindowState>,
+    pub(crate) transitions: HashMap<u64, WindowTransition>,
+    pub(crate) workspace_layouts: HashMap<u32, SplitTree>,
     pub(crate) workspace_count: u32,
     pub(crate) active_workspace: u32,
     pub(crate) overview_open: bool,
@@ -333,18 +357,23 @@ pub struct Vanta {
     pub(crate) hot_corner_hint_visible: bool,
     pub(crate) last_pointer_position: Option<Point<f64, Logical>>,
     pub(crate) touch_gesture: Option<TouchGesture>,
+    pub(crate) app_touch_slots: HashSet<i32>,
     pub(crate) window_workspaces: HashMap<u64, u32>,
     pub(crate) window_locations: HashMap<u64, Point<i32, Logical>>,
     /// Vanta-assigned stable IDs mapped to Smithay window handles.
     pub windows: HashMap<u64, Window>,
+    pub(crate) motion: crate::motion::MotionEngine,
     window_ids: WindowIdAllocator,
     pub loop_signal: LoopSignal,
     pub(crate) native_redraw_sender: Option<channel::Sender<()>>,
+    pub(crate) native_renderer_registry: Option<crate::native::NativeRendererRegistry>,
 
     // Smithay State
     pub compositor_state: CompositorState,
     pub xdg_shell_state: XdgShellState,
     pub shm_state: ShmState,
+    pub dmabuf_state: DmabufState,
+    pub(crate) dmabuf_global: Option<DmabufGlobal>,
     pub output_manager_state: OutputManagerState,
     pub seat_state: SeatState<Vanta>,
     pub data_device_state: DataDeviceState,
@@ -357,6 +386,7 @@ pub struct Vanta {
 impl Vanta {
     pub fn new(event_loop: &mut EventLoop<Self>, display: Display<Self>) -> Self {
         let start_time = std::time::Instant::now();
+        let motion_last_tick = start_time;
 
         let dh = display.handle();
 
@@ -368,6 +398,7 @@ impl Vanta {
         let compositor_state = CompositorState::new::<Self>(&dh);
         let xdg_shell_state = XdgShellState::new::<Self>(&dh);
         let shm_state = ShmState::new::<Self>(&dh, vec![]);
+        let dmabuf_state = DmabufState::new();
         let popups = PopupManager::default();
 
         let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&dh);
@@ -389,6 +420,8 @@ impl Vanta {
         // Notify clients that we have a pointer (mouse)
         // Here we assume that there is always pointer plugged in
         seat.add_pointer();
+        // Advertise touchscreen capability to Wayland clients.
+        seat.add_touch();
 
         // A space represents a two-dimensional plane. Windows and Outputs can be mapped onto it.
         //
@@ -410,9 +443,14 @@ impl Vanta {
         let overview_new_buffer = create_overview_glass_buffer();
         let overview_plus_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
         let overview_plus_vertical_buffer = SolidColorBuffer::new((0, 0), [0.58, 0.84, 0.96, 0.92]);
+        let layout_mode = LayoutMode::Adaptive;
         let floating_windows = HashSet::new();
+        let snapped_windows = HashMap::new();
+        let maximize_restore_rects = HashMap::new();
         let layout_sizes = HashMap::new();
         let minimized_windows = HashMap::new();
+        let transitions = HashMap::new();
+        let workspace_layouts = HashMap::new();
         let overview_open = false;
         let hot_corner_armed = false;
         let hot_corner_hint_visible = false;
@@ -421,6 +459,7 @@ impl Vanta {
         let hot_corner_hint_visible = false;
         let last_pointer_position: Option<Point<f64, Logical>> = None;
         let touch_gesture: Option<TouchGesture> = None;
+        let app_touch_slots = HashSet::new();
         let window_workspaces = HashMap::new();
         let window_locations = HashMap::new();
         let windows = HashMap::new();
@@ -432,9 +471,11 @@ impl Vanta {
         // Get the loop signal, used to stop the event loop
         let loop_signal = event_loop.get_signal();
         let native_redraw_sender = None;
+        let native_renderer_registry = None;
 
         Self {
             start_time,
+            motion_last_tick,
             display_handle: dh,
 
             space,
@@ -450,9 +491,14 @@ impl Vanta {
             overview_new_buffer,
             overview_plus_buffer,
             overview_plus_vertical_buffer,
+            layout_mode,
             floating_windows,
+            snapped_windows,
+            maximize_restore_rects,
             layout_sizes,
             minimized_windows,
+            transitions,
+            workspace_layouts,
             workspace_count,
             active_workspace,
             overview_open,
@@ -460,17 +506,22 @@ impl Vanta {
             hot_corner_hint_visible,
             last_pointer_position,
             touch_gesture,
+            app_touch_slots,
             window_workspaces,
             window_locations,
             windows,
+            motion: crate::motion::MotionEngine::default(),
             window_ids,
             loop_signal,
             native_redraw_sender,
+            native_renderer_registry,
             socket_name,
 
             compositor_state,
             xdg_shell_state,
             shm_state,
+            dmabuf_state,
+            dmabuf_global: None,
             output_manager_state,
             seat_state,
             data_device_state,
@@ -541,6 +592,7 @@ impl Vanta {
         let id = self.window_ids.allocate()?;
         self.window_workspaces.insert(id, self.active_workspace);
         self.window_locations.insert(id, (0, 0).into());
+        self.motion.insert_window(id, 0.0, 0.0);
         self.windows.insert(id, window);
         Some(id)
     }
@@ -646,6 +698,7 @@ impl Vanta {
             .filter(|(id, window)| {
                 self.window_workspaces.get(id) == Some(&index)
                     && !self.minimized_windows.contains_key(id)
+                    && !self.transitions.contains_key(id)
                     && window.alive()
             })
             .map(|(id, window)| (*id, window.clone()))
@@ -660,6 +713,8 @@ impl Vanta {
                 .copied()
                 .unwrap_or_else(|| (0, 0).into());
             self.space.map_element(window, location, false);
+            self.motion
+                .snap_window_position(id, f64::from(location.x), f64::from(location.y));
         }
 
         self.layout_sizes.clear();
@@ -789,10 +844,10 @@ impl Vanta {
         Ok(())
     }
 
-    /// Minimize a mapped window without unmapping its Wayland protocol role.
+    /// Animate a mapped window out before completing its minimize operation.
     pub fn minimize_window(&mut self, id: u64) -> Result<(), String> {
-        if self.minimized_windows.contains_key(&id) {
-            return Err(format!("Window {id} is already minimized"));
+        if self.minimized_windows.contains_key(&id) || self.transitions.contains_key(&id) {
+            return Err(format!("Window {id} is already minimized or transitioning"));
         }
 
         let window = self
@@ -831,6 +886,7 @@ impl Vanta {
         .unwrap_or((None, None));
 
         let was_floating = self.floating_windows.contains(&id);
+        let snap_target = self.snapped_windows.remove(&id);
 
         let keyboard = self
             .seat
@@ -839,42 +895,71 @@ impl Vanta {
 
         let had_keyboard_focus = keyboard.current_focus().as_ref() == Some(&surface);
 
+        // Move focus before beginning the exit animation.
+        if had_keyboard_focus {
+            let fallback_id = self.space.elements().rev().find_map(|candidate| {
+                self.windows.iter().find_map(|(&candidate_id, registered)| {
+                    (registered == candidate
+                        && candidate_id != id
+                        && !self.transitions.contains_key(&candidate_id)
+                        && candidate.alive())
+                    .then_some(candidate_id)
+                })
+            });
+
+            if let Some(fallback_id) = fallback_id {
+                self.focus_window_with_serial(fallback_id, SERIAL_COUNTER.next_serial())?;
+            } else {
+                self.clear_focus_with_serial(SERIAL_COUNTER.next_serial())?;
+            }
+        }
+
         window.set_activated(false);
+
         if let Some(toplevel) = window.toplevel() {
             toplevel.send_pending_configure();
         }
 
-        if had_keyboard_focus {
-            keyboard.set_focus(self, None, SERIAL_COUNTER.next_serial());
-        }
+        let (visual_x, visual_y) = self
+            .motion
+            .window(id)
+            .map(|motion| motion.position())
+            .unwrap_or((f64::from(location.x), f64::from(location.y)));
 
         self.window_locations.insert(id, location);
-        self.space.unmap_elem(&window);
-        self.layout_sizes.remove(&id);
 
-        self.minimized_windows.insert(
+        self.transitions.insert(
             id,
-            MinimizedWindowState {
+            WindowTransition::Minimizing(MinimizedWindowState {
                 location,
                 size,
                 was_floating,
                 title,
                 app_id,
-            },
+                snap_target,
+            }),
         );
 
+        // Keep the surface mapped while it shrinks and fades.
+        self.motion
+            .animate_window(id, visual_x, visual_y, 0.82, 0.0);
+
         self.relayout_windows();
+
         Ok(())
     }
 
-    /// Restore the original live window handle and its saved geometry.
+    /// Restore a minimized window with a spring-driven entrance animation.
     pub fn restore_window(&mut self, id: u64) -> Result<(), String> {
+        if self.transitions.contains_key(&id) {
+            return Err(format!("Window {id} is already transitioning"));
+        }
+
         let saved = self
             .minimized_windows
             .get(&id)
             .cloned()
             .ok_or_else(|| format!("Window {id} is not minimized"))?;
-
         let window = self
             .windows
             .get(&id)
@@ -884,7 +969,6 @@ impl Vanta {
         if !window.alive() {
             return Err(format!("Window {id} is no longer alive"));
         }
-
         if self.space.elements().any(|mapped| mapped == &window) {
             return Err(format!("Window {id} is already mapped"));
         }
@@ -893,7 +977,6 @@ impl Vanta {
             .toplevel()
             .filter(|toplevel| toplevel.alive())
             .ok_or_else(|| format!("Window {id} has no live toplevel surface"))?;
-
         let workspace = self
             .window_workspaces
             .get(&id)
@@ -904,18 +987,52 @@ impl Vanta {
         self.space.map_element(window.clone(), saved.location, true);
         self.window_locations.insert(id, saved.location);
 
-        if saved.was_floating {
+        self.motion.snap_window_position(
+            id,
+            f64::from(saved.location.x),
+            f64::from(saved.location.y),
+        );
+        self.motion.snap_window_scale(id, 0.82);
+        self.motion.set_window_opacity(id, 0.0);
+
+        if saved.was_floating && saved.snap_target.is_none() {
             self.floating_windows.insert(id);
-            toplevel.with_pending_state(|state| {
-                state.size = Some(saved.size);
-            });
-            toplevel.send_pending_configure();
         } else {
             self.floating_windows.remove(&id);
         }
 
+        if saved.was_floating || saved.snap_target.is_some() {
+            toplevel.with_pending_state(|state| {
+                state.size = Some(saved.size);
+                if saved.snap_target == Some(SnapTarget::Maximize) {
+                    state.states.set(
+                        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                    );
+                } else {
+                    state.states.unset(
+                        smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State::Maximized,
+                    );
+                }
+            });
+            toplevel.send_pending_configure();
+        }
+
+        if let Some(target) = saved.snap_target {
+            self.snapped_windows.insert(id, target);
+        }
+
         self.layout_sizes.remove(&id);
         self.minimized_windows.remove(&id);
+        self.transitions
+            .insert(id, WindowTransition::Restoring(saved.clone()));
+
+        self.motion.animate_window(
+            id,
+            f64::from(saved.location.x),
+            f64::from(saved.location.y),
+            1.0,
+            1.0,
+        );
 
         if saved.was_floating {
             self.raise_window_with_policy(&window);
@@ -923,7 +1040,7 @@ impl Vanta {
             self.relayout_windows();
         }
 
-        self.focus_window(id)
+        Ok(())
     }
 
     /// Build a deterministic overview snapshot for every workspace.
@@ -1043,11 +1160,18 @@ impl Vanta {
             .collect();
 
         for id in &removed_ids {
+            for tree in self.workspace_layouts.values_mut() {
+                tree.remove(*id);
+            }
             self.minimized_windows.remove(id);
+            self.transitions.remove(id);
             self.floating_windows.remove(id);
+            self.snapped_windows.remove(id);
+            self.maximize_restore_rects.remove(id);
             self.layout_sizes.remove(id);
             self.window_workspaces.remove(id);
             self.window_locations.remove(id);
+            self.motion.remove_window(*id);
         }
 
         self.windows.retain(|_, window| {
@@ -1095,6 +1219,19 @@ impl Vanta {
         }
 
         match request.action {
+            Action::GetLayoutMode => response(
+                RequestStatus::Completed,
+                ActionResult::LayoutMode {
+                    mode: self.layout_mode,
+                },
+            ),
+
+            Action::SetLayoutMode { mode } => {
+                self.layout_mode = mode;
+                self.relayout_windows();
+                response(RequestStatus::Completed, ActionResult::LayoutMode { mode })
+            }
+
             Action::FocusWindow { id } => match self.focus_window(id) {
                 Ok(()) => response(RequestStatus::Completed, ActionResult::Ok),
                 Err(message) => response(RequestStatus::Rejected, ActionResult::Err { message }),
@@ -1217,12 +1354,46 @@ impl Vanta {
             }
         }
 
-        // Preserve normal application-window hit-testing.
-        if let Some((window, location)) = self.space.element_under(pos) {
+        // Test application windows in Smithay's front-to-back stacking order.
+        for window in self.space.elements().rev() {
+            let Some(location) = self.space.element_location(window) else {
+                continue;
+            };
+            let Some(bbox) = self.space.element_bbox(window) else {
+                continue;
+            };
+
+            let id = self
+                .windows
+                .iter()
+                .find_map(|(&id, candidate)| (candidate == window).then_some(id));
+
+            let (visual_x, visual_y) = id
+                .and_then(|id| self.motion.window(id))
+                .map(|motion| motion.position())
+                .unwrap_or((f64::from(location.x), f64::from(location.y)));
+
+            let delta_x = visual_x - f64::from(location.x);
+            let delta_y = visual_y - f64::from(location.y);
+
+            let mut visual_bbox = bbox.to_f64();
+            visual_bbox.loc.x += delta_x;
+            visual_bbox.loc.y += delta_y;
+
+            if !visual_bbox.contains(pos) {
+                continue;
+            }
+
+            let render_location = location - window.geometry().loc;
+            let visual_location = Point::<f64, Logical>::from((
+                f64::from(render_location.x) + delta_x,
+                f64::from(render_location.y) + delta_y,
+            ));
+
             if let Some((surface, surface_location)) =
-                window.surface_under(pos - location.to_f64(), WindowSurfaceType::ALL)
+                window.surface_under(pos - visual_location, WindowSurfaceType::ALL)
             {
-                return Some((surface, (surface_location + location).to_f64()));
+                return Some((surface, surface_location.to_f64() + visual_location));
             }
         }
 
@@ -1245,6 +1416,88 @@ impl Vanta {
         }
 
         None
+    }
+
+    /// Advance window animations and complete lifecycle transitions.
+    pub(crate) fn advance_motion(&mut self) -> bool {
+        let now = std::time::Instant::now();
+        let delta = now.duration_since(self.motion_last_tick).as_secs_f64();
+        self.motion_last_tick = now;
+        let mut active = self.motion.advance(delta);
+
+        let completed: Vec<u64> = self
+            .transitions
+            .keys()
+            .copied()
+            .filter(|id| {
+                self.motion
+                    .window(*id)
+                    .map_or(true, |motion| motion.is_settled())
+            })
+            .collect();
+
+        let mut layout_changed = false;
+        let mut focus_after = Vec::new();
+
+        for id in completed {
+            let Some(transition) = self.transitions.remove(&id) else {
+                continue;
+            };
+
+            match transition {
+                WindowTransition::Minimizing(saved) => {
+                    let Some(window) = self.windows.get(&id).cloned() else {
+                        continue;
+                    };
+                    if !window.alive() {
+                        continue;
+                    }
+                    if self.space.elements().any(|mapped| mapped == &window) {
+                        self.space.unmap_elem(&window);
+                    }
+                    self.layout_sizes.remove(&id);
+                    self.minimized_windows.insert(id, saved);
+                    layout_changed = true;
+                }
+                WindowTransition::Restoring(saved) => {
+                    let Some(window) = self.windows.get(&id).cloned() else {
+                        continue;
+                    };
+                    if !window.alive() {
+                        continue;
+                    }
+
+                    let is_mapped = self.space.elements().any(|mapped| mapped == &window);
+                    let is_active_workspace =
+                        self.window_workspaces.get(&id) == Some(&self.active_workspace);
+
+                    if !is_mapped || !is_active_workspace {
+                        if is_mapped {
+                            self.space.unmap_elem(&window);
+                        }
+                        self.snapped_windows.remove(&id);
+                        self.minimized_windows.insert(id, saved);
+                        continue;
+                    }
+
+                    if !saved.was_floating {
+                        layout_changed = true;
+                    }
+                    focus_after.push(id);
+                }
+            }
+        }
+
+        if layout_changed {
+            self.relayout_windows();
+            active = true;
+        }
+
+        for id in focus_after {
+            let _ = self.focus_window(id);
+        }
+
+        active || !self.transitions.is_empty()
     }
 }
 
