@@ -1,0 +1,560 @@
+use std::time::Duration;
+
+use ab_glyph::{Font, FontRef, PxScale, ScaleFont};
+use smithay_client_toolkit::{
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    delegate_registry,
+    output::{OutputHandler, OutputState},
+    reexports::calloop::EventLoop,
+    reexports::calloop_wayland_source::WaylandSource,
+    registry::{ProvidesRegistryState, RegistryState},
+    registry_handlers,
+    seat::{pointer::{PointerEvent, PointerEventKind, PointerHandler}, Capability, SeatHandler, SeatState},
+    shell::{
+        xdg::{
+            window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
+            XdgShell,
+        },
+        WaylandSurface,
+    },
+    shm::{slot::SlotPool, Shm, ShmHandler},
+};
+use wayland_client::{
+    globals::registry_queue_init,
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    Connection, QueueHandle,
+};
+
+const INITIAL_WIDTH: u32 = 1100;
+const INITIAL_HEIGHT: u32 = 760;
+
+const BG: [u8; 4] = [24, 20, 17, 255];
+const SIDEBAR: [u8; 4] = [31, 27, 24, 255];
+const CARD: [u8; 4] = [45, 40, 36, 255];
+const ACTIVE: [u8; 4] = [66, 82, 112, 255];
+const WHITE: [u8; 4] = [244, 242, 239, 255];
+const MUTED: [u8; 4] = [170, 166, 161, 255];
+const ACCENT: [u8; 4] = [154, 190, 255, 255];
+
+struct Settings {
+    registry_state: RegistryState,
+    output_state: OutputState,
+    seat_state: SeatState,
+    pointer: Option<wl_pointer::WlPointer>,
+    selected_page: usize,
+    compositor: CompositorState,
+    xdg_shell: XdgShell,
+    shm: Shm,
+    window: Window,
+    pool: SlotPool,
+    width: u32,
+    height: u32,
+    configured: bool,
+    exit: bool,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let conn = Connection::connect_to_env()?;
+    let (globals, event_queue) = registry_queue_init(&conn)?;
+    let qh = event_queue.handle();
+
+    let mut event_loop: EventLoop<Settings> = EventLoop::try_new()?;
+    WaylandSource::new(conn.clone(), event_queue).insert(event_loop.handle())?;
+
+    let compositor = CompositorState::bind(&globals, &qh)?;
+    let output_state = OutputState::new(&globals, &qh);
+    let xdg_shell = XdgShell::bind(&globals, &qh)?;
+    let shm = Shm::bind(&globals, &qh)?;
+
+    let surface = compositor.create_surface(&qh);
+    let window = xdg_shell.create_window(surface, WindowDecorations::RequestServer, &qh);
+    window.set_title("Settings");
+    window.set_app_id("vanta-settings");
+    window.set_min_size(Some((820, 560)));
+    window.commit();
+
+    let pool = SlotPool::new((INITIAL_WIDTH * INITIAL_HEIGHT * 4) as usize, &shm)?;
+
+    let mut state = Settings {
+        registry_state: RegistryState::new(&globals),
+        output_state,
+        seat_state: SeatState::new(&globals, &qh),
+        pointer: None,
+        selected_page: 0,
+        compositor,
+        xdg_shell,
+        shm,
+        window,
+        pool,
+        width: INITIAL_WIDTH,
+        height: INITIAL_HEIGHT,
+        configured: false,
+        exit: false,
+    };
+
+    while !state.exit {
+        event_loop.dispatch(Duration::from_millis(16), &mut state)?;
+    }
+
+    Ok(())
+}
+
+fn fill_rect(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: [u8; 4],
+) {
+    let xmax = x.saturating_add(w).min(width);
+    let ymax = y.saturating_add(h).min(height);
+
+    for py in y.min(height)..ymax {
+        for px in x.min(width)..xmax {
+            let i = ((py * width + px) * 4) as usize;
+            pixels[i..i + 4].copy_from_slice(&color);
+        }
+    }
+}
+
+fn draw_text(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    text: &str,
+    x: f32,
+    baseline: f32,
+    size: f32,
+    color: [u8; 4],
+) {
+    let font_data = include_bytes!("/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf");
+    let Ok(font) = FontRef::try_from_slice(font_data) else {
+        return;
+    };
+
+    let scaled = font.as_scaled(PxScale::from(size));
+    let mut cursor_x = x;
+
+    for ch in text.chars() {
+        let glyph_id = scaled.glyph_id(ch);
+        let glyph = glyph_id
+            .with_scale_and_position(PxScale::from(size), ab_glyph::point(cursor_x, baseline));
+
+        if glyph_id.0 != 0 {
+            if let Some(outline) = font.outline_glyph(glyph) {
+                let bounds = outline.px_bounds();
+                outline.draw(|gx, gy, coverage| {
+                    let px = bounds.min.x as i32 + gx as i32;
+                    let py = bounds.min.y as i32 + gy as i32;
+
+                    if px < 0 || py < 0 || px >= width as i32 || py >= height as i32 {
+                        return;
+                    }
+
+                    let i = ((py as u32 * width + px as u32) * 4) as usize;
+                    let alpha = (coverage * color[3] as f32).clamp(0.0, 255.0) as u8;
+
+                    // Blend the glyph into the BGRA buffer.
+                    let a = alpha as f32 / 255.0;
+                    for channel in 0..3 {
+                        pixels[i + channel] = (pixels[i + channel] as f32 * (1.0 - a)
+                            + color[channel] as f32 * a)
+                            as u8;
+                    }
+                });
+            }
+        }
+
+        cursor_x += scaled.h_advance(glyph_id);
+    }
+}
+
+impl Settings {
+    fn draw(&mut self, _conn: &Connection, qh: &QueueHandle<Self>) {
+        let width = self.width;
+        let height = self.height;
+        let stride = (width * 4) as i32;
+
+        let Ok((buffer, canvas)) = self.pool.create_buffer(
+            width as i32,
+            height as i32,
+            stride,
+            wl_shm::Format::Argb8888,
+        ) else {
+            return;
+        };
+
+        let mut canvas = canvas;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&BG);
+        }
+
+        fill_rect(&mut canvas, width, height, 0, 0, 270, height, SIDEBAR);
+        fill_rect(
+            &mut canvas,
+            width,
+            height,
+            269,
+            0,
+            1,
+            height,
+            [55, 49, 44, 255],
+        );
+
+        // Native window controls, anchored to the right edge.
+        let controls_y = 16;
+        let controls = [
+            (width.saturating_sub(144), [65, 72, 88, 210], "-"),
+            (width.saturating_sub(96), [65, 72, 88, 210], "□"),
+            (width.saturating_sub(48), [130, 62, 62, 220], "×"),
+        ];
+
+        for (x, color, glyph) in controls {
+            fill_rect(&mut canvas, width, height, x, controls_y, 34, 30, color);
+            draw_text(
+                &mut canvas, width, height, glyph,
+                x as f32 + 11.0, 37.0, 17.0, WHITE,
+            );
+        }
+
+        // Brand and sidebar navigation.
+        draw_text(&mut canvas, width, height, "VANTA", 28.0, 52.0, 23.0, WHITE);
+        draw_text(
+            &mut canvas,
+            width,
+            height,
+            "SYSTEM SETTINGS",
+            28.0,
+            78.0,
+            11.0,
+            MUTED,
+        );
+
+        let pages = [
+            "Overview",
+            "Appearance",
+            "Display",
+            "Windows & Desktop",
+            "Network",
+            "Bluetooth",
+            "Power",
+            "Devices",
+        ];
+
+        for (index, page) in pages.iter().enumerate() {
+            let y = 105 + index as u32 * 47;
+
+            if index == self.selected_page {
+                fill_rect(&mut canvas, width, height, 18, y, 230, 42, ACTIVE);
+            }
+
+            draw_text(
+                &mut canvas,
+                width,
+                height,
+                page,
+                48.0,
+                y as f32 + 27.0,
+                16.0,
+                if index == self.selected_page { WHITE } else { MUTED },
+            );
+        }
+
+        // Page-aware main content.
+        draw_text(&mut canvas, width, height, pages[self.selected_page], 310.0, 76.0, 30.0, WHITE);
+
+        if self.selected_page == 0 {
+            draw_text(&mut canvas, width, height, "Configure and explore your desktop.", 310.0, 105.0, 16.0, MUTED);
+
+            fill_rect(&mut canvas, width, height, 310, 135, 720, 145, CARD);
+            draw_text(&mut canvas, width, height, "Appearance", 340.0, 177.0, 21.0, WHITE);
+            draw_text(&mut canvas, width, height, "Personalize the look, colors and desktop surfaces.", 340.0, 210.0, 15.0, MUTED);
+            draw_text(&mut canvas, width, height, "Open Appearance  >", 340.0, 247.0, 15.0, ACCENT);
+
+            fill_rect(&mut canvas, width, height, 310, 300, 720, 145, CARD);
+            draw_text(&mut canvas, width, height, "Windows & Desktop", 340.0, 342.0, 21.0, WHITE);
+            draw_text(&mut canvas, width, height, "Layouts, window behavior and workspace settings.", 340.0, 375.0, 15.0, MUTED);
+            draw_text(&mut canvas, width, height, "Open Window Settings  >", 340.0, 412.0, 15.0, ACCENT);
+
+            fill_rect(&mut canvas, width, height, 310, 465, 720, 145, CARD);
+            draw_text(&mut canvas, width, height, "Network", 340.0, 507.0, 21.0, WHITE);
+            draw_text(&mut canvas, width, height, "Connectivity and system services.", 340.0, 540.0, 15.0, MUTED);
+            draw_text(&mut canvas, width, height, "Explore Network  >", 340.0, 577.0, 15.0, ACCENT);
+        } else {
+            fill_rect(&mut canvas, width, height, 310, 135, 720, 170, CARD);
+
+            let descriptions = [
+                "Configure and explore your desktop.",
+                "Theme, accent colors, transparency and desktop surfaces.",
+                "Display modes, resolution and scaling.",
+                "Window layouts, workspaces, animation and desktop behavior.",
+                "Network connections and connectivity settings.",
+                "Bluetooth status and paired-device management.",
+                "Power profile, battery information and power behavior.",
+                "Input devices and supported hardware controls.",
+            ];
+
+            draw_text(&mut canvas, width, height, descriptions[self.selected_page], 340.0, 180.0, 16.0, MUTED);
+            draw_text(&mut canvas, width, height, "Settings controls will be added to this page.", 340.0, 225.0, 15.0, MUTED);
+        }
+
+        buffer.attach_to(self.window.wl_surface()).ok();
+        self.window
+            .wl_surface()
+            .damage_buffer(0, 0, width as i32, height as i32);
+        self.window
+            .wl_surface()
+            .frame(qh, FrameCallbackData(self.window.wl_surface().clone()));
+        self.window.commit();
+    }
+}
+
+impl CompositorHandler for Settings {
+    fn scale_factor_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_factor: i32,
+    ) {
+    }
+
+    fn transform_changed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _new_transform: wl_output::Transform,
+    ) {
+    }
+
+    fn frame(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _time: u32,
+    ) {
+        if self.configured {
+            self.draw(conn, qh);
+        }
+    }
+
+    fn surface_enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+
+    fn surface_leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
+        _output: &wl_output::WlOutput,
+    ) {
+    }
+}
+
+impl WindowHandler for Settings {
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
+        self.exit = true;
+    }
+
+    fn configure(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _window: &Window,
+        configure: WindowConfigure,
+        _serial: u32,
+    ) {
+        if let (Some(w), Some(h)) = (configure.new_size.0, configure.new_size.1) {
+            self.width = w.get();
+            self.height = h.get();
+        }
+
+        self.configured = true;
+        self.draw(conn, qh);
+    }
+}
+
+impl OutputHandler for Settings {
+    fn output_state(&mut self) -> &mut OutputState {
+        &mut self.output_state
+    }
+
+    fn new_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+    fn update_output(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+    fn output_destroyed(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _output: wl_output::WlOutput,
+    ) {
+    }
+}
+
+
+impl SeatHandler for Settings {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+    ) {
+    }
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            if let Ok(pointer) = self.seat_state.get_pointer(qh, &seat) {
+                self.pointer = Some(pointer);
+            }
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+    ) {
+    }
+}
+
+impl PointerHandler for Settings {
+    fn pointer_frame(
+        &mut self,
+        conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if event.surface != *self.window.wl_surface() {
+                continue;
+            }
+
+            if let PointerEventKind::Press { button, .. } = event.kind {
+                if button != 0x110 {
+                    continue;
+                }
+
+                let (x, y) = event.position;
+                let x = x as u32;
+                let y = y as u32;
+
+                // Window controls.
+                if (16..46).contains(&y) {
+                    if x >= self.width.saturating_sub(144)
+                        && x < self.width.saturating_sub(110)
+                    {
+                        self.window.set_minimized();
+                        continue;
+                    } else if x >= self.width.saturating_sub(96)
+                        && x < self.width.saturating_sub(62)
+                    {
+                        if self.window.is_maximized() {
+                            self.window.unset_maximized();
+                        } else {
+                            self.window.set_maximized();
+                        }
+                        continue;
+                    } else if x >= self.width.saturating_sub(48)
+                        && x < self.width.saturating_sub(14)
+                    {
+                        self.exit = true;
+                        continue;
+                    }
+                }
+
+                let mut page = None;
+
+                // Sidebar navigation.
+                if (18..248).contains(&x) && (105..481).contains(&y) {
+                    page = Some(((y - 105) / 47) as usize);
+                }
+
+                // Overview shortcuts only work on the Overview page.
+                if self.selected_page == 0 && x >= 310 && x <= 1030 {
+                    if (135..280).contains(&y) {
+                        page = Some(1);
+                    } else if (300..445).contains(&y) {
+                        page = Some(3);
+                    } else if (465..610).contains(&y) {
+                        page = Some(4);
+                    }
+                }
+
+                if let Some(page) = page {
+                    if page < 8 && page != self.selected_page {
+                        self.selected_page = page;
+                        if self.configured {
+                            self.draw(conn, qh);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl ShmHandler for Settings {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
+delegate_registry!(Settings);
+
+impl ProvidesRegistryState for Settings {
+    fn registry(&mut self) -> &mut RegistryState {
+        &mut self.registry_state
+    }
+
+    registry_handlers![OutputState, SeatState,];
+}
+
+smithay_client_toolkit::delegate_dispatch2!(Settings);

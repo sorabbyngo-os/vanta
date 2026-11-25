@@ -1,0 +1,9 @@
+[package]
+name = "vanta-settings"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+smithay-client-toolkit = "0.21"
+wayland-client = "0.31"
+ab_glyph = "0.2.32"

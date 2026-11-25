@@ -1,0 +1,11 @@
+[package]
+name = "vanta-apps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zbus = {
+    version = "6.3",
+    default-features = false,
+    features = ["default-rt", "proxy"]
+}
