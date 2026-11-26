@@ -136,7 +136,9 @@ fn blend_pixel(pixels: &mut [u8], i: usize, color: [u8; 4]) {
     // Wayland ARGB8888 on little-endian hosts is stored as BGRA.
     // Store premultiplied alpha and composite source-over.
     let sa = color[3] as u32;
-    if sa == 0 { return; }
+    if sa == 0 {
+        return;
+    }
 
     let inv = 255 - sa;
     let src_b = color[2] as u32 * sa / 255;
@@ -148,7 +150,7 @@ fn blend_pixel(pixels: &mut [u8], i: usize, color: [u8; 4]) {
     let dst_r = pixels[i + 2] as u32;
     let dst_a = pixels[i + 3] as u32;
 
-    pixels[i]     = (src_b + dst_b * inv / 255).min(255) as u8;
+    pixels[i] = (src_b + dst_b * inv / 255).min(255) as u8;
     pixels[i + 1] = (src_g + dst_g * inv / 255).min(255) as u8;
     pixels[i + 2] = (src_r + dst_r * inv / 255).min(255) as u8;
     pixels[i + 3] = (sa + dst_a * inv / 255).min(255) as u8;
@@ -165,7 +167,9 @@ fn rounded_rect(
     radius: u32,
     color: [u8; 4],
 ) {
-    if w == 0 || h == 0 { return; }
+    if w == 0 || h == 0 {
+        return;
+    }
 
     let xmax = x.saturating_add(w).min(width);
     let ymax = y.saturating_add(h).min(height);
@@ -176,13 +180,21 @@ fn rounded_rect(
             let lx = (px - x) as i32;
             let ly = (py - y) as i32;
 
-            let cx = if lx < r { r }
-                else if lx >= w as i32 - r { w as i32 - r - 1 }
-                else { lx };
+            let cx = if lx < r {
+                r
+            } else if lx >= w as i32 - r {
+                w as i32 - r - 1
+            } else {
+                lx
+            };
 
-            let cy = if ly < r { r }
-                else if ly >= h as i32 - r { h as i32 - r - 1 }
-                else { ly };
+            let cy = if ly < r {
+                r
+            } else if ly >= h as i32 - r {
+                h as i32 - r - 1
+            } else {
+                ly
+            };
 
             let dx = lx - cx;
             let dy = ly - cy;
@@ -206,13 +218,21 @@ fn glass_rect(
     radius: u32,
     color: [u8; 4],
 ) {
-    if w < 3 || h < 3 { return; }
+    if w < 3 || h < 3 {
+        return;
+    }
 
     // Soft, restrained shadow beneath the surface.
     rounded_rect(
-        pixels, width, height,
-        x.saturating_add(1), y.saturating_add(2), w, h,
-        radius, [35, 55, 85, 18],
+        pixels,
+        width,
+        height,
+        x.saturating_add(1),
+        y.saturating_add(2),
+        w,
+        h,
+        radius,
+        [35, 55, 85, 18],
     );
 
     // Frosted cool surface: use the color as tint, not as an opaque fill.
@@ -222,18 +242,19 @@ fn glass_rect(
 
     // Fine upper edge reflection.
     rounded_rect(
-        pixels, width, height,
-        x.saturating_add(2), y.saturating_add(1),
-        w.saturating_sub(4), 1, 1,
+        pixels,
+        width,
+        height,
+        x.saturating_add(2),
+        y.saturating_add(1),
+        w.saturating_sub(4),
+        1,
+        1,
         [255, 255, 255, 105],
     );
 
     // Quiet perimeter highlight.
-    rounded_rect(
-        pixels, width, height,
-        x, y, w, 1, 1,
-        [255, 255, 255, 65],
-    );
+    rounded_rect(pixels, width, height, x, y, w, 1, 1, [255, 255, 255, 65]);
 }
 
 fn draw_text(
@@ -322,7 +343,14 @@ impl Settings {
         let (bg, sidebar, card, active, white, muted) = if self.appearance_theme == 0 {
             (BG, SIDEBAR, CARD, ACTIVE, WHITE, MUTED)
         } else {
-            ([35, 43, 58, 255], [48, 58, 76, 215], [66, 79, 100, 205], [90, 122, 166, 225], [239, 246, 255, 255], [170, 188, 209, 255])
+            (
+                [35, 43, 58, 255],
+                [48, 58, 76, 215],
+                [66, 79, 100, 205],
+                [90, 122, 166, 225],
+                [239, 246, 255, 255],
+                [170, 188, 209, 255],
+            )
         };
 
         let accent_colors = [
@@ -488,7 +516,17 @@ impl Settings {
                 let (card_x, card_y, card_width, card_height) =
                     overview_card_rect(width, height, index as u32);
 
-                glass_rect(&mut canvas, width, height, card_x, card_y, card_width, card_height, 20, card);
+                glass_rect(
+                    &mut canvas,
+                    width,
+                    height,
+                    card_x,
+                    card_y,
+                    card_width,
+                    card_height,
+                    20,
+                    card,
+                );
 
                 let text_x = card_x as f32 + 30.0;
                 let title_y = card_y + card_height / 2 - 22;
@@ -540,7 +578,17 @@ impl Settings {
 
             let (card_x, card_y, card_width, card_height) = settings_page_card_rect(width, height);
 
-            glass_rect(&mut canvas, width, height, card_x, card_y, card_width, card_height, 20, card);
+            glass_rect(
+                &mut canvas,
+                width,
+                height,
+                card_x,
+                card_y,
+                card_width,
+                card_height,
+                20,
+                card,
+            );
 
             draw_text(
                 &mut canvas,
@@ -554,34 +602,119 @@ impl Settings {
             );
 
             if self.selected_page == 1 {
-                draw_text(&mut canvas, width, height, "Theme", card_x as f32 + 30.0, (card_y + 105) as f32, 18.0, white);
+                draw_text(
+                    &mut canvas,
+                    width,
+                    height,
+                    "Theme",
+                    card_x as f32 + 30.0,
+                    (card_y + 105) as f32,
+                    18.0,
+                    white,
+                );
 
                 let themes = ["Dark", "Light", "System"];
                 for (index, theme) in themes.iter().enumerate() {
                     let x = card_x + 30 + index as u32 * 145;
                     let y = card_y + 125;
                     let selected = self.appearance_theme == index;
-                    glass_rect(&mut canvas, width, height, x, y, 125, 44, 12, if selected { active } else { sidebar });
-                    draw_text(&mut canvas, width, height, theme, x as f32 + 18.0, y as f32 + 28.0, 15.0, white);
+                    glass_rect(
+                        &mut canvas,
+                        width,
+                        height,
+                        x,
+                        y,
+                        125,
+                        44,
+                        12,
+                        if selected { active } else { sidebar },
+                    );
+                    draw_text(
+                        &mut canvas,
+                        width,
+                        height,
+                        theme,
+                        x as f32 + 18.0,
+                        y as f32 + 28.0,
+                        15.0,
+                        white,
+                    );
                     if selected {
-                        glass_rect(&mut canvas, width, height, x + 10, y + 40, 105, 3, 2, accent);
+                        glass_rect(
+                            &mut canvas,
+                            width,
+                            height,
+                            x + 10,
+                            y + 40,
+                            105,
+                            3,
+                            2,
+                            accent,
+                        );
                     }
                 }
 
-                draw_text(&mut canvas, width, height, "Accent color", card_x as f32 + 30.0, (card_y + 215) as f32, 18.0, white);
+                draw_text(
+                    &mut canvas,
+                    width,
+                    height,
+                    "Accent color",
+                    card_x as f32 + 30.0,
+                    (card_y + 215) as f32,
+                    18.0,
+                    white,
+                );
                 let names = ["Blue", "Purple", "Green", "Rose"];
                 for (index, name) in names.iter().enumerate() {
                     let x = card_x + 30 + index as u32 * 145;
                     let y = card_y + 235;
                     glass_rect(&mut canvas, width, height, x, y, 125, 48, 12, sidebar);
-                    glass_rect(&mut canvas, width, height, x + 12, y + 12, 24, 24, 8, accent_colors[index]);
-                    draw_text(&mut canvas, width, height, name, x as f32 + 46.0, y as f32 + 30.0, 15.0, white);
+                    glass_rect(
+                        &mut canvas,
+                        width,
+                        height,
+                        x + 12,
+                        y + 12,
+                        24,
+                        24,
+                        8,
+                        accent_colors[index],
+                    );
+                    draw_text(
+                        &mut canvas,
+                        width,
+                        height,
+                        name,
+                        x as f32 + 46.0,
+                        y as f32 + 30.0,
+                        15.0,
+                        white,
+                    );
                     if self.accent_choice == index {
-                        glass_rect(&mut canvas, width, height, x + 10, y + 44, 105, 3, 2, accent_colors[index]);
+                        glass_rect(
+                            &mut canvas,
+                            width,
+                            height,
+                            x + 10,
+                            y + 44,
+                            105,
+                            3,
+                            2,
+                            accent_colors[index],
+                        );
                     }
                 }
 
-                draw_text(&mut canvas, width, height, "Changes preview immediately in this window.", card_x as f32 + 30.0, (card_y + 330) as f32, 14.0, muted);
+                draw_text(
+                    &mut canvas,
+                    width,
+                    height,
+                    "Changes preview immediately in this window.",
+                    card_x as f32 + 30.0,
+                    (card_y + 330) as f32,
+                    14.0,
+                    muted,
+                );
             } else {
                 draw_text(
                     &mut canvas,

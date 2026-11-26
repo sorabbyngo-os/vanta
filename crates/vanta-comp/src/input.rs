@@ -7,12 +7,13 @@ use smithay::{
     },
     input::{
         keyboard::{keysyms, FilterResult},
-        pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent},
+        pointer::{AxisFrame, ButtonEvent, Focus, MotionEvent, RelativeMotionEvent},
         touch::{DownEvent as TouchDown, MotionEvent as TouchMotion, UpEvent as TouchUp},
     },
     utils::{Logical, Point, SERIAL_COUNTER},
 };
 
+use crate::grabs::{SplitCornerGrab, SplitDividerGrab};
 use crate::state::{TouchGesture, Vanta};
 
 impl Vanta {
@@ -261,6 +262,71 @@ impl Vanta {
                 let serial = SERIAL_COUNTER.next_serial();
                 let button = event.button_code();
                 let button_state = event.state();
+
+                // Fractional-mode split dividers are interactive only in empty
+                // compositor space. Never intercept clicks over mapped surfaces.
+                if button_state == ButtonState::Pressed
+                    && event.button() == Some(MouseButton::Left)
+                    && !pointer.is_grabbed()
+                    && self.layout_mode == vanta_ipc::LayoutMode::Fractional
+                {
+                    let pointer_location = pointer.current_location();
+
+                    if self.surface_under(pointer_location).is_none() {
+                        if let Some((bounds, gap, min_size)) = self.split_edit_bounds() {
+                            if let Some(tree) = self.workspace_layouts.get(&self.active_workspace) {
+                                // Junction handles take priority over individual dividers.
+                                if let Ok(corners) = tree.corners(bounds, gap, min_size) {
+                                    let location = pointer_location.to_i32_round::<i32>();
+
+                                    if let Some(corner) = corners.iter().find(|corner| {
+                                        location.x >= corner.rect.x
+                                            && location.y >= corner.rect.y
+                                            && location.x
+                                                < corner.rect.x.saturating_add(corner.rect.width)
+                                            && location.y
+                                                < corner.rect.y.saturating_add(corner.rect.height)
+                                    }) {
+                                        if let Some(start_data) = pointer.grab_start_data() {
+                                            let grab = SplitCornerGrab::new(
+                                                start_data,
+                                                corner.outer_id,
+                                                corner.inner_id,
+                                                corner.outer_axis,
+                                                corner.inner_axis,
+                                            );
+                                            pointer.set_grab(self, grab, serial, Focus::Clear);
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                if let Ok(dividers) = tree.dividers(bounds, gap, min_size) {
+                                    let location = pointer_location.to_i32_round::<i32>();
+
+                                    if let Some(divider) = dividers.iter().find(|divider| {
+                                        location.x >= divider.rect.x
+                                            && location.y >= divider.rect.y
+                                            && location.x
+                                                < divider.rect.x.saturating_add(divider.rect.width)
+                                            && location.y
+                                                < divider.rect.y.saturating_add(divider.rect.height)
+                                    }) {
+                                        if let Some(start_data) = pointer.grab_start_data() {
+                                            let grab = SplitDividerGrab::new(
+                                                start_data,
+                                                divider.id,
+                                                divider.axis,
+                                            );
+                                            pointer.set_grab(self, grab, serial, Focus::Clear);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 if button_state == ButtonState::Pressed && !pointer.is_grabbed() {
                     let pointer_location = pointer.current_location();
