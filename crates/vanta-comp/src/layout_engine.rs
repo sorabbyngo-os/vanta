@@ -601,56 +601,72 @@ impl SplitTree {
             visible.remove(*excluded_id);
         }
 
-        let target_id = focused_window
-            .filter(|id| visible.contains(*id))
-            .or_else(|| visible.last_leaf())
-            .or_else(|| self.last_leaf())
-            .ok_or(LayoutError::InsufficientSpace)?;
+        let visible_placements = visible.layout(bounds, gap, min_size)?;
+        if visible_placements.is_empty() {
+            return Err(LayoutError::InsufficientSpace);
+        }
 
-        visible.layout(bounds, gap, min_size)?;
+        let mut ordered_placements = visible_placements;
+        ordered_placements.sort_by(|a, b| {
+            let area_a = i64::from(a.rect.width) * i64::from(a.rect.height);
+            let area_b = i64::from(b.rect.width) * i64::from(b.rect.height);
 
-        let root = self.root.as_ref().expect("tree root was checked above");
-
-        let preferred = parent_axis(root, target_id).unwrap_or_else(|| {
-            if bounds.width >= bounds.height {
-                SplitAxis::LeftRight
-            } else {
-                SplitAxis::TopBottom
-            }
+            area_b
+                .cmp(&area_a)
+                .then_with(|| {
+                    (focused_window != Some(a.window_id))
+                        .cmp(&(focused_window != Some(b.window_id)))
+                })
+                .then_with(|| a.window_id.cmp(&b.window_id))
         });
 
-        let alternate = match preferred {
-            SplitAxis::LeftRight => SplitAxis::TopBottom,
-            SplitAxis::TopBottom => SplitAxis::LeftRight,
-        };
+        for placement in ordered_placements {
+            let target_id = placement.window_id;
+            let preferred = visible
+                .root
+                .as_ref()
+                .and_then(|root| parent_axis(root, target_id))
+                .unwrap_or_else(|| {
+                    if placement.rect.width >= placement.rect.height {
+                        SplitAxis::LeftRight
+                    } else {
+                        SplitAxis::TopBottom
+                    }
+                });
 
-        for axis in [preferred, alternate] {
-            let mut candidate = self.clone();
+            let alternate = match preferred {
+                SplitAxis::LeftRight => SplitAxis::TopBottom,
+                SplitAxis::TopBottom => SplitAxis::LeftRight,
+            };
 
-            let split_id = candidate.allocate_split_id();
-            let replaced = Self::split_leaf(
-                candidate
-                    .root
-                    .as_mut()
-                    .expect("tree root was checked above"),
-                target_id,
-                window_id,
-                axis,
-                split_id,
-            );
+            for axis in [preferred, alternate] {
+                let mut candidate = self.clone();
+                let split_id = candidate.allocate_split_id();
 
-            if !replaced {
-                continue;
-            }
+                let replaced = Self::split_leaf(
+                    candidate
+                        .root
+                        .as_mut()
+                        .expect("tree root was checked above"),
+                    target_id,
+                    window_id,
+                    axis,
+                    split_id,
+                );
 
-            let mut projection = candidate.clone();
-            for excluded_id in excluded_windows {
-                projection.remove(*excluded_id);
-            }
+                if !replaced {
+                    continue;
+                }
 
-            if projection.layout(bounds, gap, min_size).is_ok() {
-                *self = candidate;
-                return Ok(());
+                let mut projection = candidate.clone();
+                for excluded_id in excluded_windows {
+                    projection.remove(*excluded_id);
+                }
+
+                if projection.layout(bounds, gap, min_size).is_ok() {
+                    *self = candidate;
+                    return Ok(());
+                }
             }
         }
 
@@ -1303,6 +1319,75 @@ mod tests {
             placement.rect.width >= MIN_SIZE.width && placement.rect.height >= MIN_SIZE.height
         }));
     }
+    #[test]
+    fn projected_insertion_prefers_larger_leaf_over_small_focused_leaf() {
+        let mut tree = SplitTree::new();
+
+        tree.root = Some(Node::Split {
+            id: SplitId(0),
+            axis: SplitAxis::LeftRight,
+            ratio: 0.25,
+            first: Box::new(Node::Leaf(1)),
+            second: Box::new(Node::Leaf(2)),
+        });
+        tree.next_split_id = 1;
+
+        tree.insert_projected(3, Some(1), &[], BOUNDS, GAP, MIN_SIZE)
+            .unwrap();
+
+        let placements = tree.layout(BOUNDS, GAP, MIN_SIZE).unwrap();
+        let first = placements.iter().find(|p| p.window_id == 1).unwrap();
+        let second = placements.iter().find(|p| p.window_id == 2).unwrap();
+        let inserted = placements.iter().find(|p| p.window_id == 3).unwrap();
+
+        // The focused, smaller window should remain unchanged.
+        assert_eq!(first.rect, Rect::new(0, 0, 477, 1080));
+
+        // The larger leaf should receive the new split.
+        assert_eq!(second.rect.y, inserted.rect.y);
+        assert_eq!(second.rect.height, inserted.rect.height);
+        assert_ne!(second.rect.x, inserted.rect.x);
+        assert_eq!(placements.len(), 3);
+    }
+
+    #[test]
+    fn projected_insertion_uses_visible_parent_axis_when_sibling_is_suspended() {
+        let mut tree = SplitTree::new();
+
+        tree.root = Some(Node::Split {
+            id: SplitId(0),
+            axis: SplitAxis::LeftRight,
+            ratio: 0.5,
+            first: Box::new(Node::Split {
+                id: SplitId(1),
+                axis: SplitAxis::TopBottom,
+                ratio: 0.5,
+                first: Box::new(Node::Leaf(1)),
+                second: Box::new(Node::Leaf(3)),
+            }),
+            second: Box::new(Node::Leaf(2)),
+        });
+        tree.next_split_id = 2;
+
+        tree.insert_projected(4, Some(1), &[3], BOUNDS, GAP, MIN_SIZE)
+            .unwrap();
+
+        assert!(tree.contains(3));
+        assert!(tree.contains(4));
+
+        let mut visible = tree.clone();
+        assert!(visible.remove(3));
+
+        let placements = visible.layout(BOUNDS, GAP, MIN_SIZE).unwrap();
+
+        let first = placements.iter().find(|p| p.window_id == 1).unwrap();
+        let inserted = placements.iter().find(|p| p.window_id == 4).unwrap();
+
+        assert_eq!(first.rect.y, inserted.rect.y);
+        assert_eq!(first.rect.height, inserted.rect.height);
+        assert_ne!(first.rect.x, inserted.rect.x);
+    }
+
     #[test]
     fn split_ratio_changes_first_child_proportion() {
         let mut tree = SplitTree::new();

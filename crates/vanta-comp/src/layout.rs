@@ -631,63 +631,74 @@ impl Vanta {
             }
 
             vanta_ipc::LayoutMode::Adaptive => {
-                let tiled_ids: HashSet<u64> = tiled.iter().map(|(id, _)| *id).collect();
+                // Keep a lone tiled window centered at a medium size.
+                // Adaptive splitting begins when additional windows arrive.
+                if tiled.len() == 1 {
+                    let width = bounds.width.min((bounds.width * 3 / 4).max(320)).min(960);
+                    let height = bounds.height.min((bounds.height * 3 / 4).max(240)).min(720);
+                    let x = bounds.x + (bounds.width - width) / 2;
+                    let y = bounds.y + (bounds.height - height) / 2;
 
-                let excluded_ids: Vec<u64> = self
-                    .windows
-                    .keys()
-                    .copied()
-                    .filter(|id| {
-                        self.window_workspaces.get(id) == Some(&self.active_workspace)
-                            && !tiled_ids.contains(id)
-                    })
-                    .collect();
+                    vec![(tiled[0].0, Rect::new(x, y, width, height))]
+                } else {
+                    let tiled_ids: HashSet<u64> = tiled.iter().map(|(id, _)| *id).collect();
 
-                let tree = self
-                    .workspace_layouts
-                    .entry(self.active_workspace)
-                    .or_default();
+                    let excluded_ids: Vec<u64> = self
+                        .windows
+                        .keys()
+                        .copied()
+                        .filter(|id| {
+                            self.window_workspaces.get(id) == Some(&self.active_workspace)
+                                && !tiled_ids.contains(id)
+                        })
+                        .collect();
 
-                // Add new windows to the persistent topology. Existing nodes
-                // and split ratios are retained across ordinary relayouts.
-                for (id, _) in &tiled {
-                    if !tree.contains(*id) {
-                        if let Err(error) = tree.insert_projected(
-                            *id,
-                            focused_window,
-                            &excluded_ids,
-                            bounds,
-                            gap,
-                            min_size,
-                        ) {
-                            tracing::warn!(
-                                window_id = *id,
-                                ?error,
-                                "Unable to insert window into adaptive layout"
-                            );
+                    let tree = self
+                        .workspace_layouts
+                        .entry(self.active_workspace)
+                        .or_default();
+
+                    // Add new windows to the persistent topology. Existing nodes
+                    // and split ratios are retained across ordinary relayouts.
+                    for (id, _) in &tiled {
+                        if !tree.contains(*id) {
+                            if let Err(error) = tree.insert_projected(
+                                *id,
+                                focused_window,
+                                &excluded_ids,
+                                bounds,
+                                gap,
+                                min_size,
+                            ) {
+                                tracing::warn!(
+                                    window_id = *id,
+                                    ?error,
+                                    "Unable to insert window into adaptive layout"
+                                );
+                            }
                         }
                     }
-                }
 
-                // Project only currently tiled windows. Do not remove floating
-                // or minimized windows from the persistent workspace tree.
-                let mut projection = tree.clone();
-                for id in excluded_ids {
-                    projection.remove(id);
-                }
+                    // Project only currently tiled windows. Do not remove floating
+                    // or minimized windows from the persistent workspace tree.
+                    let mut projection = tree.clone();
+                    for id in excluded_ids {
+                        projection.remove(id);
+                    }
 
-                match projection.layout(bounds, gap, min_size) {
-                    Ok(items) => items
-                        .into_iter()
-                        .map(|item| (item.window_id, item.rect))
-                        .collect(),
-                    Err(error) => {
-                        tracing::warn!(
-                            workspace = self.active_workspace,
-                            ?error,
-                            "Unable to calculate adaptive workspace layout"
-                        );
-                        Vec::new()
+                    match projection.layout(bounds, gap, min_size) {
+                        Ok(items) => items
+                            .into_iter()
+                            .map(|item| (item.window_id, item.rect))
+                            .collect(),
+                        Err(error) => {
+                            tracing::warn!(
+                                workspace = self.active_workspace,
+                                ?error,
+                                "Unable to calculate adaptive workspace layout"
+                            );
+                            Vec::new()
+                        }
                     }
                 }
             }
